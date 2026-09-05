@@ -3,6 +3,8 @@ from typing import Dict, Optional
 from .timing_monitor import TimingMonitor
 from .uds_monitor import UDSMonitor
 from .dbc_monitor import DBCMonitor
+from .observation_adapter import events_to_observations
+from ..models.experiment import AnomalyObservation
 
 
 class MonitorManager:
@@ -242,6 +244,19 @@ class MonitorManager:
     def get_scores(self) -> Dict[str, float]:
         with self.state_lock:
             return self.scores.copy()
+
+    def collect_observations(self) -> list[AnomalyObservation]:
+        """Drain detector event buffers into a backend-independent representation."""
+        observations: list[AnomalyObservation] = []
+        for monitor in (self.timing_monitor, self.uds_monitor, self.dbc_monitor):
+            fetch = getattr(monitor, "fetch_events", None)
+            if not fetch:
+                continue
+            bus_name = getattr(monitor, "logical_bus", None) or getattr(
+                monitor, "channel", "unknown"
+            )
+            observations.extend(events_to_observations(fetch(), bus_name))
+        return observations
 
     def is_running(self) -> bool:
         return self.running

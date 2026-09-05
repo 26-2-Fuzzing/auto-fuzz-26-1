@@ -1,6 +1,7 @@
 import random
-from typing import Dict, List
+from typing import Dict, List, Optional
 from ..logger.base_logger import log_event  
+from ..models.experiment import MutationRecord
 
 DEFAULT_BYTE_K_PROB = 0.3  
 DEFAULT_BYTE_WEIGHT = 1.0  
@@ -20,6 +21,8 @@ class Mutator:
         self.data = bytearray(data)
         self.weights = weights
         self.min_length = min_length
+        self.generated: list[bytes] = []
+        self.generated_operators: list[tuple[str, ...]] = []
 
     # Helpers
     def _log_fail(self, name: str, e: Exception):
@@ -44,8 +47,10 @@ class Mutator:
         include_orig  = bool(self.weights.get("manager.include_original", False))
 
         out: list[bytes] = []
+        traces: list[tuple[str, ...]] = []
         seen: set[bytes] = set()
         base = bytes(self.data)
+        current_trace: list[str] = []
 
         def push():
             b = bytes(self.data)
@@ -59,9 +64,11 @@ class Mutator:
             if b not in seen:
                 seen.add(b)
                 out.append(b)
+                traces.append(tuple(current_trace) or ("original",))
 
         if include_orig:
             self.data = bytearray(base)
+            current_trace = ["original"]
             push()
 
         attempt_cap = budget * 20
@@ -71,6 +78,7 @@ class Mutator:
             attempts += 1
             saved = self.data
             self.data = bytearray(base)
+            current_trace = []
 
             try:
                 k = random.randint(1, max_ops)
@@ -84,6 +92,7 @@ class Mutator:
                         "insert_byte" if enable_struct else "increment_byte",
                         "delete_byte" if enable_struct else "decrement_byte",
                     ])
+                    current_trace.append(op)
                     try:
                         getattr(self, op)()
                     except Exception as e:
@@ -98,7 +107,31 @@ class Mutator:
                 self.data = saved
 
         self.generated = out
+        self.generated_operators = traces
         return out
+
+    def mutate_records(
+        self,
+        source_bus: str,
+        message_id: int,
+        seed_id: Optional[int] = None,
+    ) -> list[MutationRecord]:
+        """Generate payloads with provenance. ``mutate_manager`` remains compatible."""
+        payloads = self.mutate_manager()
+        records: list[MutationRecord] = []
+        for payload, operators in zip(payloads, self.generated_operators):
+            records.append(
+                MutationRecord(
+                    source_bus=source_bus,
+                    message_id=message_id,
+                    original_data=bytes(self.data),
+                    mutated_data=payload,
+                    operator="+".join(operators),
+                    seed_id=seed_id,
+                    parameters={"operators": list(operators)},
+                )
+            )
+        return records
 
     # Bit Ops
     def flip_bit(self):

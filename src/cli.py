@@ -86,10 +86,27 @@ def run(config, save_json):
     can_iface = None
     if cfg["can"].get("enable", False):
         from .interface.can_interface import CANInterface
-        can_iface = CANInterface(
-            channel=cfg["can"]["channel"],
-            can_id=int(cfg["can"]["default_id"], 16)
-        )
+        from .interface.multi_bus_interface import MultiBusCANInterface
+
+        bus_configs = cfg["can"].get("buses", {})
+        if bus_configs:
+            interfaces = {
+                logical_bus: CANInterface(
+                    channel=bus_cfg["channel"],
+                    bustype=bus_cfg.get("bustype", "socketcan"),
+                    can_id=int(bus_cfg.get("default_id", cfg["can"]["default_id"]), 16),
+                    logical_bus=logical_bus,
+                )
+                for logical_bus, bus_cfg in bus_configs.items()
+                if bus_cfg.get("enable", True)
+            }
+            can_iface = MultiBusCANInterface(interfaces)
+        else:
+            can_iface = CANInterface(
+                channel=cfg["can"]["channel"],
+                can_id=int(cfg["can"]["default_id"], 16),
+                logical_bus=cfg["can"].get("logical_bus", cfg["can"]["channel"]),
+            )
 
     pipeline = AutoFuzzPipeline(cfg, can_iface=can_iface)
     results = pipeline.run()

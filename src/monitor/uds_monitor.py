@@ -70,6 +70,17 @@ class UDSMonitor:
         self.stack = isotp.CanStack(bus=self.bus, address=addr, params=isotp_params)
 
         self._fail_score = 0.0
+        self.events = []
+
+    def _emit(self, metric, value, status="FAIL"):
+        self.events.append({
+            "type": "uds",
+            "id": TARGET_UDS_ID,
+            "metric": metric,
+            "value": value,
+            "status": status,
+            "ts_ms": int(time.time() * 1000),
+        })
 
 
     # ISO-TP 송신
@@ -112,6 +123,7 @@ class UDSMonitor:
                 print("[FAIL] UDS Monitor - Session entry failed")
                 log_event("uds", TARGET_UDS_ID, "monitor_result", "session_entry_fail", "FAIL")
                 self._fail_score = SCORE_FAIL
+                self._emit("session_entry", "no_valid_response")
                 return self._fail_score
 
             # 0x3E Tester Present
@@ -120,6 +132,7 @@ class UDSMonitor:
                 print("[FAIL] UDS Monitor - Tester present failed")
                 log_event("uds", TARGET_UDS_ID, "monitor_result", "tester_present_fail", "FAIL")
                 self._fail_score = SCORE_FAIL
+                self._emit("tester_present", "no_valid_response")
                 return self._fail_score
 
             # 0x19 DTC 읽기
@@ -132,6 +145,7 @@ class UDSMonitor:
                 print(f"[FAIL] UDS Monitor - DTC collection failed")
                 log_event("uds", TARGET_UDS_ID, "monitor_result", "dtc_collection_fail", "FAIL")
                 self._fail_score = SCORE_FAIL
+                self._emit("dtc_collection", "failed")
                 return self._fail_score
             
             # DTC 개수 기준 초과
@@ -139,6 +153,7 @@ class UDSMonitor:
                 print(f"[FAIL] UDS Monitor - DTC found: {total_dtc} DTC(s)")
                 log_event("uds", TARGET_UDS_ID, "monitor_result", f"dtc_found_{total_dtc}", "FAIL")
                 self._fail_score = SCORE_FAIL
+                self._emit("dtc_count", total_dtc)
                 return self._fail_score
             
             # 모든 검사 통과
@@ -150,6 +165,7 @@ class UDSMonitor:
             print(f"[FAIL] UDS Monitor - Exception occurred: {e}")
             log_event("uds", TARGET_UDS_ID, "monitor_result", f"exception_{str(e)}", "FAIL")
             self._fail_score = SCORE_FAIL
+            self._emit("exception", str(e))
         
         print(f"[INFO] UDS Monitor finished - Final FAIL score: {self._fail_score:.1f}")
         return self._fail_score
@@ -253,3 +269,8 @@ class UDSMonitor:
         0.0 = 모두 성공, 1.0 = 하나라도 실패
         """
         return self._fail_score
+
+    def fetch_events(self):
+        events = self.events[:]
+        self.events.clear()
+        return events

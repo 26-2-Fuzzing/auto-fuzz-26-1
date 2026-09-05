@@ -4,9 +4,10 @@ import threading
 import queue
 import time
 from typing import Optional
+from .base_interface import BaseCANInterface, CANFrame
 
 
-class CANInterface:
+class CANInterface(BaseCANInterface):
     """
     단일 CAN ID 기반 송수신 인터페이스 (socketcan)
     - 기본 ID: 0x6A6
@@ -19,10 +20,12 @@ class CANInterface:
         channel: str = "vcan0",
         bustype: str = "socketcan",
         can_id: int = 0x6A6,
+        logical_bus: Optional[str] = None,
     ):
         self.channel = channel
         self.bustype = bustype
         self.can_id = can_id
+        self.logical_bus = logical_bus or channel
 
         try:
             self.bus = can.interface.Bus(channel=self.channel, bustype=self.bustype)
@@ -45,7 +48,7 @@ class CANInterface:
             while self._running:
                 try:
                     msg = self.bus.recv(timeout=1.0)
-                    if msg and msg.arbitration_id == self.can_id:
+                    if msg:
                         self._rx_queue.put(msg)
                 except Exception as e:
                     print(f"[CAN:Rx] Listener error: {e}")
@@ -75,6 +78,13 @@ class CANInterface:
         except Exception as e:
             print(f"[!] CAN send error: {e}")
 
+    def send_frame(self, frame: CANFrame) -> None:
+        if frame.bus != self.logical_bus:
+            raise ValueError(
+                f"Frame for {frame.bus!r} cannot be sent by {self.logical_bus!r}"
+            )
+        self.send_raw(frame.data, frame.arbitration_id, frame.is_extended_id)
+
     def recv(self, timeout: float = 0.1) -> Optional["can.Message"]:
         """대기 중 수신된 메시지 반환"""
         try:
@@ -82,5 +92,26 @@ class CANInterface:
         except queue.Empty:
             return None
 
+    def recv_frame(self, timeout: float = 0.1) -> Optional[CANFrame]:
+        msg = self.recv(timeout)
+        if msg is None:
+            return None
+        return CANFrame(
+            bus=self.logical_bus,
+            arbitration_id=msg.arbitration_id,
+            data=bytes(msg.data),
+            timestamp=getattr(msg, "timestamp", time.time()),
+            is_extended_id=msg.is_extended_id,
+        )
+
+    def close(self) -> None:
+        self.stop_listener()
+        shutdown = getattr(self.bus, "shutdown", None)
+        if shutdown:
+            shutdown()
+
     def __repr__(self) -> str:
-        return f"<CANInterface channel={self.channel} id={hex(self.can_id)}>"
+        return (
+            f"<CANInterface bus={self.logical_bus} channel={self.channel} "
+            f"id={hex(self.can_id)}>"
+        )

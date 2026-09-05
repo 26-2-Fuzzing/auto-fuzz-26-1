@@ -191,9 +191,9 @@ class DBCMonitor:
                 self._update_fail_score()
                 raise RuntimeError(f"enum 위반: {sig} value={val}, 허용={enum_vals}")
 
-        sigmn, sigmx = rule.get("min"), rule.get("max")
-        factor, offset = rule.get("factor"), rule.get("offset")
-        mn, mx = (sigmn - offset) / factor , (sigmx - offset) / factor
+        # cantools already returns scaled physical values. Compare those values
+        # directly and avoid arithmetic on optional factor/offset metadata.
+        mn, mx = rule.get("min"), rule.get("max")
 
         if mn is not None:
             self._total_checks += 1
