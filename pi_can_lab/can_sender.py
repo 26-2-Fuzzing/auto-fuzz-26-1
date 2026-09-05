@@ -7,6 +7,7 @@ import argparse
 import importlib
 import math
 import random
+import secrets
 import sys
 import time
 import uuid
@@ -69,6 +70,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-dlc-change", action="store_true", help="mutation 중 DLC 변경 허용")
     parser.add_argument("--include-original", action="store_true", help="mutation 목록 첫 항목에 seed payload 포함")
     parser.add_argument("--random-seed", type=int, help="재현 가능한 mutation 난수 seed")
+    parser.add_argument(
+        "--mutation-seed-source", choices=("normal", "patched"),
+        help="mutation seed로 live 원본(normal) 또는 DBC patch 결과(patched) 사용",
+    )
+    parser.add_argument("--baseline-duration", type=float, help="campaign 송신 전 passive baseline 관찰 시간(초)")
+    parser.add_argument("--normal-duration", type=float, help="campaign 정상 payload 송신 시간(초)")
+    parser.add_argument("--mutation-duration", type=float, help="campaign mutation payload 송신 시간(초)")
+    parser.add_argument("--recovery-duration", type=float, help="campaign 송신 종료 후 passive recovery 관찰 시간(초)")
     parser.add_argument("--execute", action="store_true", help="실제로 CAN 버스에 송신 (없으면 preview만 수행)")
     return parser
 
@@ -160,6 +169,13 @@ def mutation_summary(base_payload: bytes, payload: bytes) -> Dict[str, Any]:
         "xor_hex": xor_bytes.hex().upper(),
         "changed_bit_count": sum(value.bit_count() for value in xor_bytes),
     }
+
+
+def resolve_random_seed(configured_seed: Optional[int]) -> Tuple[int, bool]:
+    """Return a reproducible seed, generating a fresh one for each run if omitted."""
+    if configured_seed is not None:
+        return configured_seed, False
+    return secrets.randbits(64), True
 
 
 def transmission_schedule(
@@ -312,6 +328,7 @@ def tx_record(
     mutation: Optional[Dict[str, Any]] = None,
     tx_session_id: Optional[str] = None,
     experiment_id: Optional[str] = None,
+    phase: Optional[str] = None,
 ) -> Dict[str, Any]:
     return {
         "record_type": "can_tx",
@@ -321,6 +338,7 @@ def tx_record(
         "channel": channel,
         "tx_session_id": tx_session_id,
         "experiment_id": experiment_id,
+        "phase": phase,
         "kind": kind,
         "status": status,
         "sequence": sequence,
@@ -344,6 +362,7 @@ def run(args: argparse.Namespace) -> int:
     transmit_cfg = tx_cfg.get("transmit", {})
     safety_cfg = tx_cfg.get("safety", {})
     mutation_cfg = tx_cfg.get("mutation", {})
+    campaign_cfg = tx_cfg.get("campaign", {})
     analysis_cfg = tx_cfg.get("analysis", {})
 
     interface_name = choose(args.interface_name, bus_cfg.get("interface"), "socketcan")
@@ -363,7 +382,24 @@ def run(args: argparse.Namespace) -> int:
     allow_dlc_change = bool(args.allow_dlc_change or mutation_cfg.get("allow_dlc_change", False))
     include_original = bool(args.include_original or mutation_cfg.get("include_original", False))
     random_seed_value = choose(args.random_seed, mutation_cfg.get("random_seed"), None)
-    random_seed = int(random_seed_value) if random_seed_value is not None else None
+    configured_random_seed = int(random_seed_value) if random_seed_value is not None else None
+    random_seed, random_seed_generated = resolve_random_seed(configured_random_seed)
+    campaign_enabled = bool(campaign_cfg.get("enabled", False))
+    baseline_duration = float(choose(
+        args.baseline_duration, campaign_cfg.get("baseline_duration_seconds"), 10.0
+    ))
+    normal_duration = float(choose(
+        args.normal_duration, campaign_cfg.get("normal_duration_seconds"), 60.0
+    ))
+    campaign_mutation_value = choose(
+        args.mutation_duration,
+        campaign_cfg.get("mutation_duration_seconds"),
+        duration_seconds if duration_seconds is not None else 60.0,
+    )
+    mutation_duration = float(campaign_mutation_value)
+    recovery_duration = float(choose(
+        args.recovery_duration, campaign_cfg.get("recovery_duration_seconds"), 60.0
+    ))
     output_policy = choose(args.output_policy, tx_cfg.get("output_policy"), "append")
     experiment_id_value = choose(
         args.experiment_id, tx_cfg.get("experiment_id"), None
@@ -382,6 +418,30 @@ def run(args: argparse.Namespace) -> int:
         if duration_seconds > max_duration_seconds:
             raise ConfigurationError(
                 f"duration_seconds는 안전 제한 {max_duration_seconds:g}초 이하여야 합니다."
+            )
+    if campaign_enabled:
+        if not mutation_enabled:
+            raise ConfigurationError("campaign을 사용하려면 mutation.enabled=true여야 합니다.")
+        for field_name, value in (
+            ("baseline_duration_seconds", baseline_duration),
+            ("normal_duration_seconds", normal_duration),
+            ("mutation_duration_seconds", mutation_duration),
+            ("recovery_duration_seconds", recovery_duration),
+        ):
+            validate_finite(value, field_name, allow_equal=False)
+        max_campaign_duration = float(
+            safety_cfg.get("max_campaign_duration_seconds", 240.0)
+        )
+        validate_finite(
+            max_campaign_duration, "max_campaign_duration_seconds", allow_equal=False
+        )
+        total_campaign_duration = (
+            baseline_duration + normal_duration + mutation_duration + recovery_duration
+        )
+        if total_campaign_duration > max_campaign_duration:
+            raise ConfigurationError(
+                f"campaign 총 시간 {total_campaign_duration:g}초는 안전 제한 "
+                f"{max_campaign_duration:g}초를 초과합니다."
             )
     if (count > 1 or duration_seconds is not None) and interval_ms < min_interval_ms:
         raise ConfigurationError(
@@ -526,7 +586,13 @@ def run(args: argparse.Namespace) -> int:
     validate_finite(restore_delay_ms, "restore_delay_ms")
     execute = bool(args.execute)
 
-    mutation_base = payload
+    normal_payload = base_payload if base_payload is not None else payload
+    mutation_seed_source = str(choose(
+        args.mutation_seed_source, mutation_cfg.get("seed_source"), "patched"
+    ))
+    if mutation_seed_source not in {"patched", "normal"}:
+        raise ConfigurationError("mutation.seed_source는 patched 또는 normal이어야 합니다.")
+    mutation_base = normal_payload if mutation_seed_source == "normal" else payload
     if mutation_enabled:
         payloads = generate_mutations(
             mutation_base,
@@ -555,16 +621,26 @@ def run(args: argparse.Namespace) -> int:
         f"[TX]    corpus={len(payloads)}{duration_text}, interval={interval_ms:g}ms, "
         f"restore={bool(restore and base_payload is not None)}"
     )
+    if campaign_enabled:
+        print(
+            f"[CAMPAIGN] baseline={baseline_duration:g}s(passive) -> "
+            f"normal={normal_duration:g}s -> mutation={mutation_duration:g}s -> "
+            f"recovery={recovery_duration:g}s(passive)"
+        )
+        print(f"[NORMAL] 0x{frame_id:X}#{normal_payload.hex().upper()}")
     if mutation_enabled:
         print(
             f"[MUT]   max_ops={max_operations}, structural={allow_dlc_change}, "
             f"include_seed={include_original}, random_seed={random_seed}"
+            f" ({'auto' if random_seed_generated else 'fixed'})"
         )
     print(f"[LOG]   {output_path}")
     print(f"[LOG]   policy={output_policy}, experiment_id={experiment_id or '-'}")
     if not execute:
         print("[SAFE]  PREVIEW이므로 송신하지 않습니다. 확인 후 --execute를 추가하세요.")
-        if duration_seconds is not None:
+        if campaign_enabled:
+            print("[SAFE]  preview는 phase를 대기하지 않고 normal 1개와 mutation corpus 1회를 표시합니다.")
+        elif duration_seconds is not None:
             print(
                 f"[SAFE]  실제 실행은 {duration_seconds:g}초 동안 payload corpus를 순환하며, "
                 "preview는 corpus를 한 번만 표시합니다."
@@ -596,94 +672,134 @@ def run(args: argparse.Namespace) -> int:
                         "duration_seconds": duration_seconds,
                         "interval_ms": interval_ms,
                     },
+                    "campaign": {
+                        "enabled": campaign_enabled,
+                        "baseline_duration_seconds": baseline_duration if campaign_enabled else None,
+                        "normal_duration_seconds": normal_duration if campaign_enabled else None,
+                        "mutation_duration_seconds": mutation_duration if campaign_enabled else None,
+                        "recovery_duration_seconds": recovery_duration if campaign_enabled else None,
+                        "normal_data_hex": normal_payload.hex().upper() if campaign_enabled else None,
+                    },
                     "mutation": {
                         "enabled": mutation_enabled,
                         "base_data_hex": mutation_base.hex().upper(),
+                        "seed_source": mutation_seed_source,
                         "max_operations": max_operations,
                         "allow_dlc_change": allow_dlc_change,
                         "include_original": include_original,
                         "random_seed": random_seed,
+                        "random_seed_generated": random_seed_generated,
                     },
                 },
             )
             attempted_count = 0
-            active_duration = duration_seconds if execute else None
-            for sequence, current_payload in transmission_schedule(
-                payloads,
-                interval_ms / 1000.0,
-                active_duration,
-            ):
-                attempted_count = sequence
-                attempt_ns = time.time_ns()
-                if execute:
-                    assert bus is not None
-                    message = create_message(frame_id, current_payload, is_extended, is_fd, bitrate_switch)
-                    try:
-                        bus.send(message, timeout=send_timeout)
-                        status = "sent"
-                    except Exception as exc:
-                        failed = tx_record(
-                            bus_name,
-                            channel,
-                            frame_id,
-                            current_payload,
-                            is_extended,
-                            is_fd,
-                            "send_error",
-                            sequence,
-                            message_name_arg,
-                            assignments if assignments else None,
-                            kind="mutation" if mutation_enabled else "inject",
-                            mutation=(
-                                mutation_summary(mutation_base, current_payload)
-                                if mutation_enabled else None
-                            ),
-                            tx_session_id=tx_session_id,
-                            experiment_id=experiment_id,
-                        )
-                        failed["send_attempt_wall_time_ns"] = attempt_ns
-                        failed["error"] = f"{type(exc).__name__}: {exc}"
-                        write_jsonl(handle, failed)
-                        handle.flush()
-                        raise
-                else:
-                    status = "preview"
-                kind = "inject"
-                if mutation_enabled:
-                    kind = "seed" if current_payload == mutation_base else "mutation"
-                record = tx_record(
-                    bus_name,
-                    channel,
-                    frame_id,
-                    current_payload,
-                    is_extended,
-                    is_fd,
-                    status,
-                    sequence,
-                    message_name_arg,
-                    assignments if assignments else None,
-                    kind=kind,
-                    mutation=(
-                        mutation_summary(mutation_base, current_payload)
-                        if mutation_enabled else None
-                    ),
-                    tx_session_id=tx_session_id,
-                    experiment_id=experiment_id,
-                )
-                record["send_attempt_wall_time_ns"] = attempt_ns
-                write_jsonl(
-                    handle,
-                    record,
-                )
+
+            def phase_marker(phase: str, event: str, duration: float) -> None:
+                write_jsonl(handle, {
+                    "record_type": "tx_phase",
+                    **now_fields(),
+                    "host": hostname(),
+                    "bus": bus_name,
+                    "tx_session_id": tx_session_id,
+                    "experiment_id": experiment_id,
+                    "phase": phase,
+                    "event": event,
+                    "duration_seconds": duration,
+                    "execute": execute,
+                })
                 handle.flush()
-                print(
-                    f"[TX {sequence:06}{'' if active_duration is not None else f'/{len(payloads):06}'}] "
-                    f"{status.upper()} "
-                    f"0x{frame_id:X}#{current_payload.hex().upper()}"
+                print(f"[PHASE] {phase} {event} ({duration:g}s)")
+
+            def passive_phase(phase: str, duration: float) -> None:
+                phase_marker(phase, "start", duration)
+                if execute:
+                    time.sleep(duration)
+                phase_marker(phase, "end", duration)
+
+            def transmit_phase(
+                phase: str,
+                phase_payloads: Sequence[bytes],
+                phase_duration: Optional[float],
+                mutated: bool,
+            ) -> None:
+                nonlocal attempted_count
+                marker_duration = phase_duration or 0.0
+                phase_marker(phase, "start", marker_duration)
+                active_duration = phase_duration if execute else None
+                for phase_sequence, current_payload in transmission_schedule(
+                    phase_payloads, interval_ms / 1000.0, active_duration
+                ):
+                    attempted_count += 1
+                    attempt_ns = time.time_ns()
+                    kind = "normal" if phase == "normal" else "inject"
+                    if mutated:
+                        kind = "seed" if current_payload == mutation_base else "mutation"
+                    details = (
+                        mutation_summary(mutation_base, current_payload)
+                        if mutated else None
+                    )
+                    record_signals = (
+                        assignments if assignments and not campaign_enabled else None
+                    )
+                    if execute:
+                        assert bus is not None
+                        message = create_message(
+                            frame_id, current_payload, is_extended, is_fd, bitrate_switch
+                        )
+                        try:
+                            bus.send(message, timeout=send_timeout)
+                            status = "sent"
+                        except Exception as exc:
+                            failed = tx_record(
+                                bus_name, channel, frame_id, current_payload,
+                                is_extended, is_fd, "send_error", attempted_count,
+                                message_name_arg,
+                                record_signals,
+                                kind=kind, mutation=details,
+                                tx_session_id=tx_session_id,
+                                experiment_id=experiment_id, phase=phase,
+                            )
+                            failed["phase_sequence"] = phase_sequence
+                            failed["send_attempt_wall_time_ns"] = attempt_ns
+                            failed["error"] = f"{type(exc).__name__}: {exc}"
+                            write_jsonl(handle, failed)
+                            handle.flush()
+                            raise
+                    else:
+                        status = "preview"
+                    record = tx_record(
+                        bus_name, channel, frame_id, current_payload,
+                        is_extended, is_fd, status, attempted_count,
+                        message_name_arg,
+                        record_signals,
+                        kind=kind, mutation=details,
+                        tx_session_id=tx_session_id,
+                        experiment_id=experiment_id, phase=phase,
+                    )
+                    record["phase_sequence"] = phase_sequence
+                    record["send_attempt_wall_time_ns"] = attempt_ns
+                    write_jsonl(handle, record)
+                    handle.flush()
+                    print(
+                        f"[TX {phase}:{phase_sequence:06}] {status.upper()} "
+                        f"0x{frame_id:X}#{current_payload.hex().upper()}"
+                    )
+                phase_marker(phase, "end", marker_duration)
+
+            if campaign_enabled:
+                passive_phase("baseline", baseline_duration)
+                transmit_phase("normal", [normal_payload], normal_duration, False)
+                transmit_phase("mutation", payloads, mutation_duration, True)
+            else:
+                transmit_phase(
+                    "mutation" if mutation_enabled else "inject",
+                    payloads,
+                    duration_seconds,
+                    mutation_enabled,
                 )
 
             if restore and base_payload is not None:
-                if restore_delay_ms:
+                if execute and restore_delay_ms:
                     time.sleep(restore_delay_ms / 1000.0)
                 for sequence in range(1, restore_count + 1):
                     restore_attempt_ns = time.time_ns()
@@ -709,6 +825,7 @@ def run(args: argparse.Namespace) -> int:
                         kind="restore",
                         tx_session_id=tx_session_id,
                         experiment_id=experiment_id,
+                        phase="recovery" if campaign_enabled else "restore",
                     )
                     restore_record["send_attempt_wall_time_ns"] = restore_attempt_ns
                     write_jsonl(handle, restore_record)
@@ -716,8 +833,10 @@ def run(args: argparse.Namespace) -> int:
                         f"[RESTORE {sequence:03}/{restore_count:03}] "
                         f"{status.upper()} 0x{frame_id:X}#{base_payload.hex().upper()}"
                     )
-                    if sequence < restore_count:
+                    if execute and sequence < restore_count:
                         time.sleep(interval_ms / 1000.0)
+            if campaign_enabled:
+                passive_phase("recovery", recovery_duration)
             write_jsonl(
                 handle,
                 {
@@ -730,7 +849,7 @@ def run(args: argparse.Namespace) -> int:
                     "experiment_id": experiment_id,
                     "status": "completed",
                     "execute": execute,
-                    "planned": None if active_duration is not None else len(payloads),
+                    "planned": None if execute and (campaign_enabled or duration_seconds is not None) else attempted_count,
                     "payload_corpus_size": len(payloads),
                     "duration_seconds": duration_seconds,
                     "attempted": attempted_count,

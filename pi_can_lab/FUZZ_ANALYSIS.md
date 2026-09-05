@@ -51,8 +51,11 @@ python3 pi_can_lab/can_sender.py \
   --experiment-id "$EXPERIMENT_ID" --execute
 ```
 
-수신은 TX 전 baseline을 충분히 기록하고, TX 종료 뒤 recovery 구간까지 유지한 다음 Ctrl+C로
-끝냅니다. 권장 기본값은 baseline 10초 이상, response 2초, recovery 10초 이상입니다.
+`sender_hazard_mutation.yaml`의 phased campaign은 passive baseline 10초, 정상 0x366
+60초, mutation 0x366 60초, 원본 1회 복원, passive recovery 60초 순으로
+진행합니다. 수신기는 campaign 전체와 마지막 recovery까지 계속 실행하십시오.
+분석기는 phase tag가 있으면 normal 송신을 stimulus에서 제외하고 mutation만
+비교합니다.
 
 ## TX 상관분석 보고서
 
@@ -93,6 +96,8 @@ CRC, 정상 센서 변동으로 인한 신규 payload는 안정 비트와 DBC �
 4. recovery에서 정상 안정 비트/신호로 돌아오는지 확인합니다.
 5. CAN 오류가 있는 회차는 기능 결과와 버스 과부하 결과를 분리합니다.
 6. 실제 램프, 모터, 릴레이 동작은 영상·전류·GPIO 등 별도 physical oracle로 기록합니다.
+7. 매 회차의 자동 생성 seed를 TX manifest에서 보관하고, 유의미한 회차는
+   `--random-seed`로 재현하여 동일 반응이 나오는지 확인합니다.
 
 JSONL은 삭제하거나 요약본으로 대체하지 마십시오. 판정 기준이 바뀌어도 원본으로 다시
 분석할 수 있어야 합니다.

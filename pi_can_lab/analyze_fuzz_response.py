@@ -103,6 +103,7 @@ def load_tx_events(path: Path) -> List[Dict[str, Any]]:
             "is_extended_id": bool(record.get("is_extended_id", False)),
             "payload": parse_data(record.get("data_hex", record.get("payload"))),
             "kind": record.get("kind", "mutation"),
+            "phase": record.get("phase"),
             "mutation": record.get("mutation"),
             "tx_session_id": record.get("tx_session_id"),
             "experiment_id": record.get("experiment_id"),
@@ -825,7 +826,12 @@ def build_parser() -> argparse.ArgumentParser:
 def run(args: argparse.Namespace) -> int:
     tx_path = args.tx.expanduser().resolve()
     all_tx_events = load_tx_events(tx_path)
-    tx_events = [event for event in all_tx_events if event.get("kind") != "restore"]
+    phased_mutations = [
+        event for event in all_tx_events if event.get("phase") == "mutation"
+    ]
+    tx_events = phased_mutations or [
+        event for event in all_tx_events if event.get("kind") != "restore"
+    ]
     restore_events = [event for event in all_tx_events if event.get("kind") == "restore"]
     if not tx_events:
         raise ConfigurationError("restore가 아닌 sent TX stimulus가 없습니다.")
@@ -833,7 +839,7 @@ def run(args: argparse.Namespace) -> int:
         raise ConfigurationError("rate ratio는 low < 1 < high여야 합니다.")
     database = load_dbc(args.dbc.expanduser().resolve()) if args.dbc else None
     first_tx_ns = tx_events[0]["time_ns"]
-    last_tx_ns = all_tx_events[-1]["time_ns"]
+    last_tx_ns = tx_events[-1]["time_ns"]
     baseline_start_ns = first_tx_ns - int(args.baseline_seconds * 1_000_000_000)
     stimulus_end_ns = last_tx_ns + int(args.response_seconds * 1_000_000_000)
     recovery_end_ns = stimulus_end_ns + int(args.recovery_seconds * 1_000_000_000)

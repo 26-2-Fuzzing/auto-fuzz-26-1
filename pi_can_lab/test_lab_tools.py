@@ -12,9 +12,12 @@ from analyze_fuzz_response import analyse_bus, build_parser as build_analysis_pa
 from can_common import ConfigurationError
 from can_receiver import build_parser as build_receiver_parser, run as run_receiver, validate_runtime_number
 from can_sender import (
+    build_parser as build_sender_parser,
     capture_live_payload,
     generate_mutations,
     mutation_summary,
+    resolve_random_seed,
+    run as run_sender,
     transmission_schedule,
 )
 
@@ -35,6 +38,15 @@ class MutationTests(unittest.TestCase):
         payloads = generate_mutations(self.BASE, 32, 3, False, False, 366)
         self.assertEqual(len(payloads), 32)
         self.assertNotIn(self.BASE, payloads)
+
+    def test_missing_seed_gets_a_logged_per_run_seed(self) -> None:
+        with patch("can_sender.secrets.randbits", side_effect=[101, 202]):
+            first, first_generated = resolve_random_seed(None)
+            second, second_generated = resolve_random_seed(None)
+        self.assertEqual((first, second), (101, 202))
+        self.assertTrue(first_generated)
+        self.assertTrue(second_generated)
+        self.assertEqual(resolve_random_seed(366), (366, False))
 
     def test_mutation_summary(self) -> None:
         payload = bytes.fromhex("00000000200000F0")
@@ -109,6 +121,62 @@ class MutationTests(unittest.TestCase):
             capture_live_payload(
                 FakeBus([stable, bytes(8), stable]), 0x366, False, 1.0, 3, 1.0
             )
+
+    def test_campaign_preview_logs_all_phases_without_waiting(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "tx.jsonl"
+            config = root / "sender.yaml"
+            config.write_text(
+                """
+bus:
+  interface: virtual
+  channel: test
+sender:
+  id: 0x366
+  data: 00000000200000F0
+  output: tx.jsonl
+  mutation:
+    enabled: true
+    seed_source: normal
+    max_operations: 2
+    include_original: false
+    random_seed: 366
+  campaign:
+    enabled: true
+    baseline_duration_seconds: 1
+    normal_duration_seconds: 60
+    mutation_duration_seconds: 60
+    recovery_duration_seconds: 1
+  transmit:
+    count: 4
+    interval_ms: 10
+    restore_original: false
+  safety:
+    max_count: 4
+    max_duration_seconds: 60
+    max_campaign_duration_seconds: 122
+    min_interval_ms: 10
+""".strip(),
+                encoding="utf-8",
+            )
+            args = build_sender_parser().parse_args(["--config", str(config)])
+            self.assertEqual(run_sender(args), 0)
+            records = [json.loads(line) for line in output.read_text().splitlines()]
+            phases = [
+                (item["phase"], item["event"])
+                for item in records if item["record_type"] == "tx_phase"
+            ]
+            self.assertEqual(phases, [
+                ("baseline", "start"), ("baseline", "end"),
+                ("normal", "start"), ("normal", "end"),
+                ("mutation", "start"), ("mutation", "end"),
+                ("recovery", "start"), ("recovery", "end"),
+            ])
+            tx = [item for item in records if item["record_type"] == "can_tx"]
+            self.assertEqual([item["phase"] for item in tx], [
+                "normal", "mutation", "mutation", "mutation", "mutation",
+            ])
 
 
 class ReceiverValidationTests(unittest.TestCase):
@@ -241,10 +309,23 @@ class ResponseAnalysisTests(unittest.TestCase):
                     "record_type": "can_tx",
                     "status": "sent",
                     "sequence": 1,
+                    "send_attempt_wall_time_ns": 19_000_000_000,
+                    "arbitration_id": 0x366,
+                    "is_extended_id": False,
+                    "data_hex": "00000000200000F0",
+                    "kind": "normal",
+                    "phase": "normal",
+                },
+                {
+                    "record_type": "can_tx",
+                    "status": "sent",
+                    "sequence": 2,
                     "send_attempt_wall_time_ns": 20_000_000_000,
                     "arbitration_id": 0x366,
                     "is_extended_id": False,
                     "data_hex": "00001000200000F0",
+                    "kind": "mutation",
+                    "phase": "mutation",
                 },
             ]
             rx_records = [
@@ -281,6 +362,8 @@ class ResponseAnalysisTests(unittest.TestCase):
             ])
             self.assertEqual(run_analysis(args), 0)
             result = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(result["tx"]["frame_count"], 1)
+            self.assertEqual(result["tx"]["first_tx_ns"], 20_000_000_000)
             self.assertEqual(
                 result["buses"][0]["direct_correlation"]["novel_matched_tx_count"],
                 1,

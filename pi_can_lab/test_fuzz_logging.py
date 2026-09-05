@@ -33,6 +33,20 @@ class NumberedOutputTests(unittest.TestCase):
             self.assertTrue(config["write_report"])
             self.assertEqual(config["output"], f"logs/{bus}_can.jsonl")
 
+    def test_hazard_campaign_has_requested_phases_and_fresh_seed(self) -> None:
+        root = Path(__file__).resolve().parent
+        sender = yaml.safe_load(
+            (root / "sender_hazard_mutation.yaml").read_text(encoding="utf-8")
+        )["sender"]
+        self.assertIsNone(sender["mutation"]["random_seed"])
+        self.assertEqual(sender["mutation"]["seed_source"], "normal")
+        self.assertFalse(sender["mutation"]["include_original"])
+        campaign = sender["campaign"]
+        self.assertTrue(campaign["enabled"])
+        self.assertEqual(campaign["normal_duration_seconds"], 60.0)
+        self.assertEqual(campaign["mutation_duration_seconds"], 60.0)
+        self.assertGreater(campaign["recovery_duration_seconds"], 0)
+
 
 class CaptureReportTests(unittest.TestCase):
     def test_socketcan_rx_overflow_is_human_readable(self) -> None:

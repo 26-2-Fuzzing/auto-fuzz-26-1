@@ -9,10 +9,12 @@ sender:
   output_policy: numbered
 
   # A5.dbc: Blinkmodi_02, standard ID 0x366, DLC 8.
-  # live payload에서 BM_Warnblinken을 먼저 ON으로 patch한 뒤 그 payload를
+  # live payload를 정상 0x366으로 캡처하고 그 payload 자체를
   # 상위 저장소 src.mutation.mutator.Mutator의 seed로 사용합니다.
   message: Blinkmodi_02
   id: 0x366
+  # 기본 seed_source=normal에서는 아래 patch를 mutation seed로 쓰지 않습니다.
+  # --mutation-seed-source patched로 실행하는 별도 캠페인에서만 적용됩니다.
   set:
     BM_Warnblinken: 1
 
@@ -24,16 +26,24 @@ sender:
 
   mutation:
     enabled: true
+    seed_source: normal
     max_operations: 3
     allow_dlc_change: false
-    include_original: true
-    # 같은 캠페인을 재현하려면 정수값으로 고정하십시오.
-    random_seed: 366
+    include_original: false
+    # null이면 매 실행마다 새 seed를 만들고 TX manifest에 기록합니다.
+    # 유의미한 회차를 재현할 때는 그 manifest의 seed를 --random-seed로 지정하십시오.
+    random_seed: null
+
+  campaign:
+    enabled: true
+    # baseline/recovery는 CAN을 송신하지 않고 수신기가 관찰하는 구간입니다.
+    baseline_duration_seconds: 10.0
+    normal_duration_seconds: 60.0
+    mutation_duration_seconds: 60.0
+    recovery_duration_seconds: 60.0
 
   transmit:
     count: 256
-    # 256개 mutation을 순환하며 30초 동안 계속 송신합니다.
-    duration_seconds: 30.0
     interval_ms: 10.0
     send_timeout_seconds: 1.0
     restore_original: true
@@ -42,6 +52,7 @@ sender:
 
   safety:
     max_count: 256
-    max_duration_seconds: 30.0
+    max_duration_seconds: 60.0
+    max_campaign_duration_seconds: 190.0
     min_interval_ms: 10.0
     allow_protected_dbc_patch: false
