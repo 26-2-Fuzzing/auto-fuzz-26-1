@@ -248,64 +248,75 @@ class ExperimentRunner:
         state = {**state, "next_mutation_id": store.next_mutation_id()}
         trial_id = store.next_trial_id()
         trial_dir = store.create_trial(trial_id)
-        original = self.probe_payload(source_bus, can_id)
-        if reproduce_mutation_id is not None:
-            parent_data = next((
-                item for item in state.get("mutation_history", [])
-                if int(item.get("mutation_id", -1)) == reproduce_mutation_id
-            ), None)
-            if parent_data is None:
-                raise ConfigurationError(
-                    f"mutation {reproduce_mutation_id} is not in completed mutation_history"
-                )
-            parent = MutationCase.from_dict(parent_data)
-            if parent.source_bus != source_bus or parent.can_id != can_id:
-                raise ConfigurationError("reproduction source bus/target ID differs from the parent mutation")
-            if original != parent.original_payload:
-                raise ConfigurationError(
-                    "live baseline differs from the parent mutation; refusing unsafe reproduction"
-                )
-            mutation = replace(
-                parent,
-                mutation_id=int(state["next_mutation_id"]),
-                parent_mutation_id=parent.mutation_id,
-                reproduction_of_mutation_id=parent.mutation_id,
-                generation_reason=f"Explicit reproduction of mutation {parent.mutation_id}",
-                strategy_mode="REPRODUCE",
-                random_seed=random_seed,
-                created_at=utc_now(),
-            )
-            decision = StrategyDecision(
-                "REPRODUCE", "EXACT_REPRODUCTION", parent.mutation_id,
-                parent.changed_bytes[0] if parent.changed_bytes else None,
-                mutation.generation_reason,
-            )
-        else:
-            mutation, decision = selector.select_mutation(
-                state=state, original_payload=original, source_bus=source_bus,
-                can_id=can_id, random_seed=random_seed,
-            )
-        signal = dbc_signal_metadata(mutation, dbc_path)
-        if signal is not None:
-            mutation = replace(mutation, signal=signal)
-        store.write_json(trial_dir / "mutation.json", mutation.to_dict())
-
-        clocks = self.check_clocks()
         metadata: dict[str, Any] = {
             "schema_version": 1,
-            "status": "prepared",
+            "status": "preparing",
             "experiment_id": store.experiment_id,
             "trial_id": trial_id,
             "target_id": f"0x{can_id:X}",
             "source_bus": source_bus.upper(),
-            "mutation_id": mutation.mutation_id,
             "random_seed": random_seed,
             "feedback_snapshot_total_trials": int(state.get("total_trials", 0)),
-            "strategy": decision.__dict__,
-            "clock_offsets": clocks,
             "start_time": utc_now(),
         }
         store.write_json(trial_dir / "metadata.json", metadata)
+        try:
+            original = self.probe_payload(source_bus, can_id)
+            if reproduce_mutation_id is not None:
+                parent_data = next((
+                    item for item in state.get("mutation_history", [])
+                    if int(item.get("mutation_id", -1)) == reproduce_mutation_id
+                ), None)
+                if parent_data is None:
+                    raise ConfigurationError(
+                        f"mutation {reproduce_mutation_id} is not in completed mutation_history"
+                    )
+                parent = MutationCase.from_dict(parent_data)
+                if parent.source_bus != source_bus or parent.can_id != can_id:
+                    raise ConfigurationError("reproduction source bus/target ID differs from the parent mutation")
+                if original != parent.original_payload:
+                    raise ConfigurationError(
+                        "live baseline differs from the parent mutation; refusing unsafe reproduction"
+                    )
+                mutation = replace(
+                    parent,
+                    mutation_id=int(state["next_mutation_id"]),
+                    parent_mutation_id=parent.mutation_id,
+                    reproduction_of_mutation_id=parent.mutation_id,
+                    generation_reason=f"Explicit reproduction of mutation {parent.mutation_id}",
+                    strategy_mode="REPRODUCE",
+                    random_seed=random_seed,
+                    created_at=utc_now(),
+                )
+                decision = StrategyDecision(
+                    "REPRODUCE", "EXACT_REPRODUCTION", parent.mutation_id,
+                    parent.changed_bytes[0] if parent.changed_bytes else None,
+                    mutation.generation_reason,
+                )
+            else:
+                mutation, decision = selector.select_mutation(
+                    state=state, original_payload=original, source_bus=source_bus,
+                    can_id=can_id, random_seed=random_seed,
+                )
+            signal = dbc_signal_metadata(mutation, dbc_path)
+            if signal is not None:
+                mutation = replace(mutation, signal=signal)
+            store.write_json(trial_dir / "mutation.json", mutation.to_dict())
+
+            clocks = self.check_clocks()
+            metadata.update({
+                "status": "prepared",
+                "mutation_id": mutation.mutation_id,
+                "strategy": decision.__dict__,
+                "clock_offsets": clocks,
+            })
+            store.write_json(trial_dir / "metadata.json", metadata)
+        except Exception as exc:
+            metadata["status"] = "failed"
+            metadata["end_time"] = utc_now()
+            metadata["error"] = f"{type(exc).__name__}: {exc}"
+            store.write_json(trial_dir / "metadata.json", metadata)
+            raise
 
         remote_cfg = self.config.get("remote", {})
         remote_dir = remote_join(
@@ -316,6 +327,7 @@ class ExperimentRunner:
         source_manager = self.managers[source_bus]
         trial_cfg = self.config.get("trial", {})
         captured = False
+        feedback_committed = False
         try:
             self.capture.start_all(store.experiment_id, trial_id)
             captured = True
@@ -371,15 +383,19 @@ class ExperimentRunner:
             threshold = float(self.config.get("feedback", {}).get("interesting_score_threshold", 0.6))
             feedback = create_trial_feedback(trial_id, mutation, analysis["anomalies"], threshold)
             store.write_json(trial_dir / "feedback.json", feedback)
+            metadata["status"] = "analyzed"
+            store.write_json(trial_dir / "metadata.json", metadata)
             new_state = store.record_completed_trial(mutation, feedback)
+            feedback_committed = True
             metadata["status"] = "completed"
             store.write_json(trial_dir / "metadata.json", metadata)
             self.print_summary(trial_id, mutation, analysis, feedback, selector.decide(new_state, random_seed))
             return feedback
         except Exception as exc:
-            metadata["status"] = "failed"
+            metadata["status"] = "analyzed" if feedback_committed else "failed"
             metadata["end_time"] = utc_now()
-            metadata["error"] = f"{type(exc).__name__}: {exc}"
+            error_field = "completion_error" if feedback_committed else "error"
+            metadata[error_field] = f"{type(exc).__name__}: {exc}"
             store.write_json(trial_dir / "metadata.json", metadata)
             if captured:
                 try:
@@ -459,6 +475,9 @@ def run(args: argparse.Namespace) -> int:
         "random_seed": args.random_seed, "runner_config": config,
     }
     store = ExperimentStore(root, experiment_id, snapshot)
+    reconciled = store.reconcile_analyzed_trials()
+    if reconciled:
+        print("[RECOVER] completed analyzed trials: " + ", ".join(map(str, reconciled)))
     selector = TrialStrategySelector(config.get("feedback", {}))
     runner = ExperimentRunner(config)
     print(f"[Experiment Start] id={experiment_id}, source={source_bus}, target=0x{target_id:X}")

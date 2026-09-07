@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -52,6 +53,27 @@ class FeedbackStateTests(unittest.TestCase):
         self.assertEqual(reloaded["next_mutation_id"], 2)
         self.assertEqual(reloaded["mutation_statistics"]["BIT_FLIP"]["interesting"], 1)
         self.assertEqual(reloaded["interesting_mutations"][0]["mutation_id"], 1)
+        self.assertEqual(reloaded["completed_trial_ids"], [1])
+
+    def test_analyzed_trial_reconciliation_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = ExperimentStore(Path(directory), 42, {"target": "0x366"})
+            trial = store.create_trial(1)
+            feedback = create_trial_feedback(1, mutation(), [], 0.6)
+            store.write_json(trial / "metadata.json", {
+                "status": "analyzed", "trial_id": 1,
+            })
+            store.write_json(trial / "mutation.json", mutation().to_dict())
+            store.write_json(trial / "feedback.json", feedback)
+
+            self.assertEqual(store.reconcile_analyzed_trials(), [1])
+            self.assertEqual(store.reconcile_analyzed_trials(), [])
+            state = store.load_feedback_state()
+            metadata = json.loads((trial / "metadata.json").read_text())
+
+        self.assertEqual(state["total_trials"], 1)
+        self.assertEqual(state["completed_trial_ids"], [1])
+        self.assertEqual(metadata["status"], "completed")
 
     def test_trial_feedback_maps_one_mutation_to_many_anomalies(self) -> None:
         feedback = create_trial_feedback(3, mutation(84), [
@@ -192,6 +214,38 @@ class TrialAnalysisTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Incomplete capture"):
                 validate_capture_log(path, 42)
 
+    def test_jitter_from_zero_baseline_stddev_is_detected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "i_can.jsonl"
+            baseline = [1_000_000_000 + index * 20_000_000 for index in range(5)]
+            mutation_stamps = [
+                2_000_000_000, 2_010_000_000, 2_040_000_000,
+                2_050_000_000, 2_080_000_000,
+            ]
+            path.write_text("".join(
+                self.record(stamp, "i_can", 0x123, "00")
+                for stamp in baseline + mutation_stamps
+            ), encoding="utf-8")
+            result = analyze_trial(
+                rx_paths={"i_can": path},
+                phase_times_ns={
+                    "baseline_start": 1_000_000_000,
+                    "baseline_end": 1_500_000_000,
+                    "mutation_start": 2_000_000_000,
+                    "mutation_end": 2_500_000_000,
+                },
+                mutation=mutation(),
+                thresholds={
+                    "minimum_baseline_frames": 5,
+                    "minimum_timing_intervals": 3,
+                    "timing_relative_change": 0.25,
+                    "timing_stddev_absolute_ms": 2.0,
+                },
+            )
+        timing = next(item for item in result["anomalies"] if item["type"] == "TIMING")
+        self.assertEqual(timing["evidence"]["baseline_stddev_ms"], 0.0)
+        self.assertEqual(timing["evidence"]["mutation_stddev_ms"], 10.0)
+
 
 class FakeManager:
     def __init__(self, bus: str):
@@ -233,6 +287,38 @@ class RemoteCaptureTests(unittest.TestCase):
             self.assertEqual(set(paths), set(managers))
             self.assertTrue(all(path.is_file() for path in paths.values()))
         self.assertTrue(all(manager.stopped for manager in managers.values()))
+
+    def test_partial_start_failure_stops_late_successes(self) -> None:
+        class StartManager(FakeManager):
+            def __init__(self, bus: str, *, fail=False, delay=0.0):
+                super().__init__(bus)
+                self.fail = fail
+                self.delay = delay
+
+            def ensure_directory(self, path):
+                if self.delay:
+                    time.sleep(self.delay)
+                if self.fail:
+                    raise RuntimeError("start failed")
+                super().ensure_directory(path)
+
+        managers = {
+            "p_can": StartManager("p_can", fail=True),
+            "b_can": StartManager("b_can", delay=0.05),
+            "i_can": StartManager("i_can", delay=0.05),
+        }
+        capture = RemoteCapture(
+            managers,
+            {bus: "/project/pi_can_lab" for bus in managers},
+            {bus: "python3" for bus in managers},
+            {bus: f"receiver_{bus[0]}_can.yaml" for bus in managers},
+            "/tmp/trials",
+        )
+        with self.assertRaisesRegex(RuntimeError, "Capture start failure"):
+            capture.start_all(42, 1)
+        self.assertEqual(managers["b_can"].stopped, [101])
+        self.assertEqual(managers["i_can"].stopped, [101])
+        self.assertFalse(capture.handles)
 
 
 class TrialSenderTests(unittest.TestCase):
@@ -328,8 +414,9 @@ class FakeRunnerManager(FakeManager):
 
 
 class ExperimentRunnerIntegrationTests(unittest.TestCase):
-    def test_completed_trial_updates_state_only_after_collection_and_analysis(self) -> None:
-        config = {
+    @staticmethod
+    def config() -> dict:
+        return {
             "remote": {
                 "project_dir": "/project/pi_can_lab",
                 "capture_root": "/tmp/trials",
@@ -349,6 +436,39 @@ class ExperimentRunnerIntegrationTests(unittest.TestCase):
             },
             "anomaly_thresholds": {"minimum_baseline_frames": 5},
         }
+
+    def test_preparation_failure_is_recorded_without_feedback(self) -> None:
+        config = self.config()
+        with tempfile.TemporaryDirectory() as directory:
+            store = ExperimentStore(Path(directory), 42, config)
+            runner = ExperimentRunner(config, manager_factory=FakeRunnerManager)
+
+            def fail_probe(*args):
+                del args
+                raise RuntimeError("probe failed")
+
+            runner.probe_payload = fail_probe
+            try:
+                with self.assertRaisesRegex(RuntimeError, "probe failed"):
+                    runner.run_trial(
+                        store=store, source_bus="b_can", can_id=0x366,
+                        random_seed=366,
+                        selector=TrialStrategySelector(config["feedback"]),
+                        dbc_path=None,
+                    )
+            finally:
+                runner.close()
+            metadata = json.loads(
+                (store.path / "trial_0001" / "metadata.json").read_text()
+            )
+            state = store.load_feedback_state()
+
+        self.assertEqual(metadata["status"], "failed")
+        self.assertIn("probe failed", metadata["error"])
+        self.assertEqual(state["total_trials"], 0)
+
+    def test_completed_trial_updates_state_only_after_collection_and_analysis(self) -> None:
+        config = self.config()
         with tempfile.TemporaryDirectory() as directory:
             store = ExperimentStore(Path(directory), 42, config)
             runner = ExperimentRunner(config, manager_factory=FakeRunnerManager)

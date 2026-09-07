@@ -376,7 +376,7 @@ class GuidedMutationTests(unittest.TestCase):
                 FakeBus([stable, bytes(8), stable]), 0x366, False, 1.0, 3, 1.0
             )
 
-    def test_campaign_preview_logs_all_phases_without_waiting(self) -> None:
+    def test_campaign_preview_logs_all_phases_and_restores_raw_original(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             output = root / "tx.jsonl"
@@ -405,7 +405,7 @@ sender:
   transmit:
     count: 4
     interval_ms: 10
-    restore_original: false
+    restore_original: true
   safety:
     max_count: 4
     max_duration_seconds: 60
@@ -430,7 +430,10 @@ sender:
             tx = [item for item in records if item["record_type"] == "can_tx"]
             self.assertEqual([item["phase"] for item in tx], [
                 "normal", "mutation", "mutation", "mutation", "mutation",
+                "recovery",
             ])
+            self.assertEqual(tx[-1]["kind"], "restore")
+            self.assertEqual(tx[-1]["data_hex"], "00000000200000F0")
 
 
 class ReceiverValidationTests(unittest.TestCase):

@@ -46,6 +46,7 @@ anomaly_thresholds:
   minimum_timing_intervals: 3
   new_message_minimum_frames: 3
   timing_relative_change: 0.25
+  timing_stddev_absolute_ms: 2.0
   frequency_relative_change: 0.50
   message_loss_ratio: 0.10
   payload_novel_ratio: 0.20

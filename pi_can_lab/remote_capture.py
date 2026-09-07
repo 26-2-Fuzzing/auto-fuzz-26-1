@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -59,19 +59,31 @@ class RemoteCapture:
     def start_all(self, experiment_id: int, trial_id: int) -> dict[str, CaptureHandle]:
         if self.handles:
             raise RuntimeError("Captures are already running")
+        started: dict[str, CaptureHandle] = {}
+        errors: list[str] = []
         with ThreadPoolExecutor(max_workers=len(self.managers)) as executor:
             futures = {
-                bus: executor.submit(self._start_one, bus, experiment_id, trial_id)
+                executor.submit(self._start_one, bus, experiment_id, trial_id): bus
                 for bus in self.managers
             }
-            try:
-                self.handles = {bus: future.result() for bus, future in futures.items()}
-            except Exception:
-                for bus, future in futures.items():
-                    if future.done() and not future.exception():
-                        handle = future.result()
-                        self.managers[bus].stop_process(handle.process)
-                raise
+            for future in as_completed(futures):
+                bus = futures[future]
+                try:
+                    started[bus] = future.result()
+                except Exception as exc:
+                    errors.append(f"{bus}: {exc}")
+        if errors:
+            cleanup_errors = []
+            for bus, handle in started.items():
+                try:
+                    self.managers[bus].stop_process(handle.process)
+                except Exception as exc:
+                    cleanup_errors.append(f"{bus}: {exc}")
+            message = "Capture start failure: " + "; ".join(sorted(errors))
+            if cleanup_errors:
+                message += "; cleanup failure: " + "; ".join(sorted(cleanup_errors))
+            raise RuntimeError(message)
+        self.handles = started
         return dict(self.handles)
 
     def stop_all(self) -> None:

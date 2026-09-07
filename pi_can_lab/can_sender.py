@@ -743,9 +743,11 @@ def run(args: argparse.Namespace) -> int:
         print(f"[DBC]   {definition.name} / set={assignments}")
         print(f"[BASE]  {base_payload.hex().upper() if base_payload is not None else '-'}")
     duration_text = f", duration={duration_seconds:g}s (cycle)" if duration_seconds is not None else ""
+    restore_payload = normal_payload
+    should_restore = restore and (base_payload is not None or campaign_enabled)
     print(
         f"[TX]    corpus={len(payloads)}{duration_text}, interval={interval_ms:g}ms, "
-        f"restore={bool(restore and base_payload is not None)}"
+        f"restore={should_restore}"
     )
     if campaign_enabled:
         print(
@@ -943,7 +945,7 @@ def run(args: argparse.Namespace) -> int:
                     mutation_enabled,
                 )
 
-            if restore and base_payload is not None:
+            if should_restore:
                 if execute and restore_delay_ms:
                     time.sleep(restore_delay_ms / 1000.0)
                 for sequence in range(1, restore_count + 1):
@@ -951,7 +953,7 @@ def run(args: argparse.Namespace) -> int:
                     if execute:
                         assert bus is not None
                         message = create_message(
-                            frame_id, base_payload, is_extended, is_fd, bitrate_switch
+                            frame_id, restore_payload, is_extended, is_fd, bitrate_switch
                         )
                         bus.send(message, timeout=send_timeout)
                         status = "sent"
@@ -961,7 +963,7 @@ def run(args: argparse.Namespace) -> int:
                         bus_name,
                         channel,
                         frame_id,
-                        base_payload,
+                        restore_payload,
                         is_extended,
                         is_fd,
                         status,
@@ -976,7 +978,7 @@ def run(args: argparse.Namespace) -> int:
                     write_jsonl(handle, restore_record)
                     print(
                         f"[RESTORE {sequence:03}/{restore_count:03}] "
-                        f"{status.upper()} 0x{frame_id:X}#{base_payload.hex().upper()}"
+                        f"{status.upper()} 0x{frame_id:X}#{restore_payload.hex().upper()}"
                     )
                     if execute and sequence < restore_count:
                         time.sleep(interval_ms / 1000.0)

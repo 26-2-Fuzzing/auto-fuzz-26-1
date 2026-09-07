@@ -112,7 +112,7 @@ experiments/experiment_0042/
 
 `feedback_state.json`은 완료된 Trial만 반영하며 다음 정보를 누적합니다.
 
-- `total_trials`, `next_mutation_id`
+- `total_trials`, `next_mutation_id`, 멱등 완료 처리를 위한 `completed_trial_ids`
 - 모든 `mutation_history`
 - 점수순 `interesting_mutations`와 anomaly type
 - operator별 `executed`/`interesting` 통계
@@ -134,6 +134,12 @@ Mutation에는 원본/변경 payload, operator, byte/bit, DBC decode가 가능�
 모든 비율과 anomaly threshold는 `experiment_runner.yaml`에서 바꿉니다. 동일한
 `random_seed + feedback_state + config + baseline payload`는 동일 선택을 재현합니다. 실제
 baseline payload가 달라지면 안전하고 의미 있는 mutation을 위해 결과도 달라질 수 있습니다.
+주기가 완전히 일정한 baseline에서 새 jitter가 발생하는 경우에는
+`timing_stddev_absolute_ms` 절대 임계값을 사용합니다.
+
+분석 산출물 기록 후 상태는 `analyzed`를 거쳐 `completed`가 됩니다. 이 사이에 runner가
+중단되면 다음 실행이 Trial ID 기준으로 FeedbackState를 중복 없이 반영하고 완료 상태를
+복구합니다.
 
 ## 현재 한계
 

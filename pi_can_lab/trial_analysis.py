@@ -126,6 +126,7 @@ def analyze_trial(
     mutation_duration = max((mutation_end - mutation_start) / 1e9, 1e-9)
 
     timing_relative = float(thresholds.get("timing_relative_change", 0.25))
+    timing_stddev_absolute = float(thresholds.get("timing_stddev_absolute_ms", 2.0))
     frequency_relative = float(thresholds.get("frequency_relative_change", 0.5))
     loss_ratio = float(thresholds.get("message_loss_ratio", 0.1))
     payload_ratio_threshold = float(thresholds.get("payload_novel_ratio", 0.2))
@@ -191,14 +192,27 @@ def analyze_trial(
         if baseline_intervals >= min_timing_intervals and mutation_intervals >= min_timing_intervals:
             timing_changes = {
                 name: _relative(baseline[name], observed[name])
-                for name in ("mean_cycle_time_ms", "median_cycle_time_ms", "cycle_time_stddev_ms")
+                for name in ("mean_cycle_time_ms", "median_cycle_time_ms")
             }
             maximum = max((value for value in timing_changes.values() if value is not None), default=0.0)
-            if maximum >= timing_relative:
-                add_anomaly(bus, can_id, "TIMING", _score(maximum, timing_relative), {
+            baseline_stddev = baseline["cycle_time_stddev_ms"]
+            mutation_stddev = observed["cycle_time_stddev_ms"]
+            stddev_increase = max(0.0, mutation_stddev - baseline_stddev)
+            relative_triggered = maximum >= timing_relative
+            stddev_triggered = stddev_increase >= timing_stddev_absolute
+            if relative_triggered or stddev_triggered:
+                scores = []
+                if relative_triggered:
+                    scores.append(_score(maximum, timing_relative))
+                if stddev_triggered:
+                    scores.append(_score(stddev_increase, timing_stddev_absolute))
+                add_anomaly(bus, can_id, "TIMING", max(scores), {
                     "relative_changes": timing_changes,
                     "baseline_mean_ms": baseline["mean_cycle_time_ms"],
                     "mutation_mean_ms": observed["mean_cycle_time_ms"],
+                    "baseline_stddev_ms": baseline_stddev,
+                    "mutation_stddev_ms": mutation_stddev,
+                    "stddev_absolute_increase_ms": stddev_increase,
                 })
         if base_count and mutation_count:
             baseline_payloads = set(baseline["payloads"])

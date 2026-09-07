@@ -48,6 +48,7 @@ class ExperimentStore:
             "experiment_id": self.experiment_id,
             "total_trials": 0,
             "next_mutation_id": 1,
+            "completed_trial_ids": [],
             "interesting_mutations": [],
             "mutation_history": [],
             "mutation_statistics": {},
@@ -101,6 +102,16 @@ class ExperimentStore:
         feedback: Mapping[str, Any],
     ) -> dict[str, Any]:
         state = self.load_feedback_state()
+        trial_id = int(feedback["trial_id"])
+        completed_trial_ids = {
+            int(value) for value in state.get("completed_trial_ids", [])
+        }
+        mutation_already_recorded = any(
+            int(item.get("mutation_id", -1)) == mutation.mutation_id
+            for item in state.get("mutation_history", [])
+        )
+        if trial_id in completed_trial_ids or mutation_already_recorded:
+            return state
         history = list(state.get("mutation_history", []))
         history.append(mutation.to_dict())
         state["mutation_history"] = history
@@ -128,8 +139,34 @@ class ExperimentStore:
             interesting.sort(key=lambda item: (-float(item["score"]), int(item["mutation_id"])))
             state["interesting_mutations"] = interesting
         state["last_feedback"] = dict(feedback)
+        completed_trial_ids.add(trial_id)
+        state["completed_trial_ids"] = sorted(completed_trial_ids)
         self.save_feedback_state(state)
         return self.load_feedback_state()
+
+    def reconcile_analyzed_trials(self) -> list[int]:
+        """Finish analyzed trials idempotently after an interrupted commit."""
+        reconciled = []
+        for trial_dir in sorted(self.path.glob("trial_*")):
+            metadata_path = trial_dir / "metadata.json"
+            mutation_path = trial_dir / "mutation.json"
+            feedback_path = trial_dir / "feedback.json"
+            if not all(path.is_file() for path in (metadata_path, mutation_path, feedback_path)):
+                continue
+            with metadata_path.open("r", encoding="utf-8") as handle:
+                metadata = json.load(handle)
+            if metadata.get("status") != "analyzed":
+                continue
+            with mutation_path.open("r", encoding="utf-8") as handle:
+                mutation = MutationCase.from_dict(json.load(handle))
+            with feedback_path.open("r", encoding="utf-8") as handle:
+                feedback = json.load(handle)
+            self.record_completed_trial(mutation, feedback)
+            metadata["status"] = "completed"
+            metadata.pop("completion_error", None)
+            _atomic_json(metadata_path, metadata)
+            reconciled.append(int(metadata["trial_id"]))
+        return reconciled
 
     def complete(self) -> None:
         path = self.path / "experiment.json"
