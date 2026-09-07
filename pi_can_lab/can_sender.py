@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import importlib
 import math
 import random
 import secrets
@@ -35,14 +34,17 @@ from can_common import (
     validate_frame_id,
     write_jsonl,
 )
+from mutation_engine import Mutator
+from mutation_feedback import generate_guided_mutations, load_feedback_hints
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="B-CAN에 제한된 횟수 또는 시간 동안 raw/DBC 기반 CAN 프레임을 송신합니다."
+        description="지정 CAN 버스에 제한된 횟수 또는 시간 동안 raw/DBC 기반 프레임을 송신합니다."
     )
     parser.add_argument("--config", help="sender YAML 설정 파일")
     parser.add_argument("--channel", help="SocketCAN 채널 (기본: can0)")
+    parser.add_argument("--bus-name", help="TX manifest에 기록할 논리 source bus")
     parser.add_argument("--interface", dest="interface_name", help="python-can interface (기본: socketcan)")
     parser.add_argument("--dbc", help="DBC 파일 경로")
     parser.add_argument("--id", dest="frame_id", help="CAN ID (예: 0x65A)")
@@ -65,11 +67,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fd", action="store_true", help="raw payload를 CAN FD 프레임으로 송신")
     parser.add_argument("--no-restore", action="store_true", help="DBC patch 후 원본 payload 복원 송신 안 함")
     parser.add_argument("--allow-protected", action="store_true", help="CRC/counter 추정 신호가 있는 DBC 메시지 patch 허용")
-    parser.add_argument("--mutate", action="store_true", help="상위 저장소 Mutator로 payload mutation 생성")
+    parser.add_argument("--mutate", action="store_true", help="pi_can_lab Mutator로 payload mutation 생성")
     parser.add_argument("--max-operations", type=int, help="mutation payload 하나당 최대 연산 수")
     parser.add_argument("--allow-dlc-change", action="store_true", help="mutation 중 DLC 변경 허용")
     parser.add_argument("--include-original", action="store_true", help="mutation 목록 첫 항목에 seed payload 포함")
     parser.add_argument("--random-seed", type=int, help="재현 가능한 mutation 난수 seed")
+    parser.add_argument("--mutation-data", help="Trial runner가 선택한 단일 mutation payload")
+    parser.add_argument("--mutation-id", type=int, help="Trial mutation 고유 ID")
+    parser.add_argument("--parent-mutation-id", type=int, help="Feedback parent mutation ID")
+    parser.add_argument("--mutation-operator", help="명시적 Trial mutation operator")
+    parser.add_argument("--generation-reason", help="Feedback 기반 mutation 생성 이유")
+    parser.add_argument("--feedback", help="이전 analyze_fuzz_response.py JSON 결과")
+    parser.add_argument("--guided-ratio", type=float, help="guided mutation 비율(0~1)")
+    parser.add_argument(
+        "--bit-operation-ratio", type=float,
+        help="random exploration의 bit 단위 연산 비율(0~1)",
+    )
     parser.add_argument(
         "--mutation-seed-source", choices=("normal", "patched"),
         help="mutation seed로 live 원본(normal) 또는 DBC patch 결과(patched) 사용",
@@ -210,21 +223,6 @@ def transmission_schedule(
             sleeper(min(interval_seconds, remaining))
 
 
-def repository_mutator() -> Any:
-    """Load the repository Mutator while keeping pi_can_lab directly executable."""
-    repository_root = Path(__file__).resolve().parent.parent
-    root_text = str(repository_root)
-    if root_text not in sys.path:
-        sys.path.insert(0, root_text)
-    try:
-        return importlib.import_module("src.mutation.mutator").Mutator
-    except (ImportError, AttributeError) as exc:
-        raise RuntimeError(
-            "상위 저장소의 src.mutation.mutator.Mutator를 불러오지 못했습니다. "
-            "pi_can_lab만 복사하지 말고 저장소 전체를 사용하세요."
-        ) from exc
-
-
 def generate_mutations(
     base_payload: bytes,
     count: int,
@@ -232,8 +230,32 @@ def generate_mutations(
     allow_dlc_change: bool,
     include_original: bool,
     random_seed: Optional[int],
+    bit_operation_ratio: Optional[float] = None,
 ) -> List[bytes]:
-    """Generate mutations with the same engine used by the repository fuzzer."""
+    return [
+        payload
+        for payload, _ in generate_mutation_entries(
+            base_payload,
+            count,
+            max_operations,
+            allow_dlc_change,
+            include_original,
+            random_seed,
+            bit_operation_ratio,
+        )
+    ]
+
+
+def generate_mutation_entries(
+    base_payload: bytes,
+    count: int,
+    max_operations: int,
+    allow_dlc_change: bool,
+    include_original: bool,
+    random_seed: Optional[int],
+    bit_operation_ratio: Optional[float] = None,
+) -> List[Tuple[bytes, Dict[str, Any]]]:
+    """Generate payloads together with mutation operator provenance."""
     if max_operations < 1:
         raise ConfigurationError("max_operations는 1 이상이어야 합니다.")
 
@@ -246,21 +268,25 @@ def generate_mutations(
         "manager.structural": allow_dlc_change,
         "manager.include_original": include_original,
     }
+    if bit_operation_ratio is not None:
+        weights["manager.bit_operation_ratio"] = bit_operation_ratio
     random_state = random.getstate()
     try:
         if random_seed is not None:
             random.seed(random_seed)
-        generated = repository_mutator()(
+        mutator = Mutator(
             data=base_payload,
             weights=weights,
             min_length=1,
-        ).mutate_manager()
+        )
+        generated = mutator.mutate_manager()
+        traces = mutator.generated_operators
     finally:
         random.setstate(random_state)
 
-    payloads: List[bytes] = []
+    entries: List[Tuple[bytes, Dict[str, Any]]] = []
     seen: set[bytes] = set()
-    for payload in generated:
+    for payload, operators in zip(generated, traces):
         item = bytes(payload)
         if not allow_dlc_change and len(item) != len(base_payload):
             continue
@@ -268,19 +294,33 @@ def generate_mutations(
             continue
         if item not in seen:
             seen.add(item)
-            payloads.append(item)
-        if len(payloads) == count:
+            entries.append((
+                item,
+                {
+                    "source": "exploration",
+                    "strategy": "random",
+                    "operators": list(operators),
+                },
+            ))
+        if len(entries) == count:
             break
 
     if include_original and base_payload not in seen:
-        payloads.insert(0, base_payload)
-        payloads = payloads[:count]
-    if len(payloads) != count:
+        entries.insert(0, (
+            base_payload,
+            {
+                "source": "exploration",
+                "strategy": "original",
+                "operators": ["original"],
+            },
+        ))
+        entries = entries[:count]
+    if len(entries) != count:
         raise RuntimeError(
-            f"요청한 mutation {count}개 중 {len(payloads)}개만 생성됐습니다. "
+            f"요청한 mutation {count}개 중 {len(entries)}개만 생성됐습니다. "
             "count 또는 max_operations를 조정하세요."
         )
-    return payloads
+    return entries
 
 
 def load_assignments(configured: Any, command_line: List[str]) -> Dict[str, Any]:
@@ -362,12 +402,15 @@ def run(args: argparse.Namespace) -> int:
     transmit_cfg = tx_cfg.get("transmit", {})
     safety_cfg = tx_cfg.get("safety", {})
     mutation_cfg = tx_cfg.get("mutation", {})
+    feedback_cfg = mutation_cfg.get("feedback", {})
+    if not isinstance(feedback_cfg, dict):
+        raise ConfigurationError("mutation.feedback은 mapping이어야 합니다.")
     campaign_cfg = tx_cfg.get("campaign", {})
     analysis_cfg = tx_cfg.get("analysis", {})
 
     interface_name = choose(args.interface_name, bus_cfg.get("interface"), "socketcan")
     channel = choose(args.channel, bus_cfg.get("channel"), "can0")
-    bus_name = str(tx_cfg.get("bus_name", "b_can"))
+    bus_name = str(choose(args.bus_name, tx_cfg.get("bus_name"), "b_can")).lower()
     count = int(choose(args.count, transmit_cfg.get("count"), 1))
     duration_value = choose(args.duration, transmit_cfg.get("duration_seconds"), None)
     duration_seconds = float(duration_value) if duration_value is not None else None
@@ -378,12 +421,32 @@ def run(args: argparse.Namespace) -> int:
     min_interval_ms = float(safety_cfg.get("min_interval_ms", 10.0))
     allow_protected = bool(args.allow_protected or safety_cfg.get("allow_protected_dbc_patch", False))
     mutation_enabled = bool(args.mutate or mutation_cfg.get("enabled", False))
+    explicit_mutation = parse_can_data(args.mutation_data) if args.mutation_data else None
     max_operations = int(choose(args.max_operations, mutation_cfg.get("max_operations"), 3))
     allow_dlc_change = bool(args.allow_dlc_change or mutation_cfg.get("allow_dlc_change", False))
     include_original = bool(args.include_original or mutation_cfg.get("include_original", False))
     random_seed_value = choose(args.random_seed, mutation_cfg.get("random_seed"), None)
     configured_random_seed = int(random_seed_value) if random_seed_value is not None else None
     random_seed, random_seed_generated = resolve_random_seed(configured_random_seed)
+    bit_operation_ratio = float(choose(
+        args.bit_operation_ratio,
+        mutation_cfg.get("bit_operation_ratio"),
+        0.75,
+    ))
+    guided_ratio = float(choose(
+        args.guided_ratio,
+        feedback_cfg.get("guided_ratio"),
+        0.5,
+    ))
+    feedback_value = (
+        args.feedback
+        if args.feedback is not None
+        else feedback_cfg.get("path")
+    )
+    feedback_path = (
+        resolve_path(feedback_value, None if args.feedback is not None else config_path)
+        if feedback_value else None
+    )
     campaign_enabled = bool(campaign_cfg.get("enabled", False))
     baseline_duration = float(choose(
         args.baseline_duration, campaign_cfg.get("baseline_duration_seconds"), 10.0
@@ -409,10 +472,18 @@ def run(args: argparse.Namespace) -> int:
 
     if count < 1 or count > max_count:
         raise ConfigurationError(f"count는 1~{max_count} 범위여야 합니다.")
+    if explicit_mutation is not None and count != 1:
+        raise ConfigurationError("--mutation-data Trial 모드에서는 --count 1이어야 합니다.")
+    if explicit_mutation is not None and not mutation_enabled:
+        raise ConfigurationError("--mutation-data를 사용하려면 mutation이 활성화되어야 합니다.")
     validate_finite(interval_ms, "interval_ms")
     validate_finite(send_timeout, "send_timeout_seconds")
     validate_finite(max_duration_seconds, "max_duration_seconds", allow_equal=False)
     validate_finite(min_interval_ms, "min_interval_ms")
+    if not 0.0 <= bit_operation_ratio <= 1.0:
+        raise ConfigurationError("bit_operation_ratio는 0~1 범위여야 합니다.")
+    if not 0.0 <= guided_ratio <= 1.0:
+        raise ConfigurationError("guided_ratio는 0~1 범위여야 합니다.")
     if duration_seconds is not None:
         validate_finite(duration_seconds, "duration_seconds", allow_equal=False)
         if duration_seconds > max_duration_seconds:
@@ -593,15 +664,70 @@ def run(args: argparse.Namespace) -> int:
     if mutation_seed_source not in {"patched", "normal"}:
         raise ConfigurationError("mutation.seed_source는 patched 또는 normal이어야 합니다.")
     mutation_base = normal_payload if mutation_seed_source == "normal" else payload
+    feedback_hints = []
+    guided_entries = []
+    mutation_metadata: Dict[bytes, Dict[str, Any]] = {}
     if mutation_enabled:
-        payloads = generate_mutations(
-            mutation_base,
-            count,
-            max_operations,
-            allow_dlc_change,
-            include_original,
-            random_seed,
-        )
+        if explicit_mutation is not None:
+            if len(explicit_mutation) != len(mutation_base):
+                raise ConfigurationError(
+                    "Trial mutation payload 길이는 baseline payload 길이와 같아야 합니다."
+                )
+            if explicit_mutation == mutation_base:
+                raise ConfigurationError("Trial mutation payload는 baseline과 달라야 합니다.")
+            combined_entries = [(
+                explicit_mutation,
+                {
+                    "source": "trial_runner",
+                    "strategy": "previous_trial_feedback",
+                    "operators": [args.mutation_operator or "EXPLICIT"],
+                    "mutation_id": args.mutation_id,
+                    "parent_mutation_id": args.parent_mutation_id,
+                    "generation_reason": args.generation_reason,
+                },
+            )]
+        else:
+            random_entries = generate_mutation_entries(
+                mutation_base,
+                count,
+                max_operations,
+                allow_dlc_change,
+                include_original,
+                random_seed,
+                bit_operation_ratio,
+            )
+            if feedback_path is not None:
+                if not feedback_path.is_file():
+                    raise ConfigurationError(
+                        f"feedback 분석 JSON을 찾을 수 없습니다: {feedback_path}"
+                    )
+                feedback_hints = load_feedback_hints(feedback_path)
+                guided_limit = min(count, int(round(count * guided_ratio)))
+                guided_entries = generate_guided_mutations(
+                    mutation_base, feedback_hints, guided_limit
+                )
+
+            combined_entries = []
+            seen_payloads: set[bytes] = set()
+            for item in guided_entries:
+                if item.payload not in seen_payloads:
+                    seen_payloads.add(item.payload)
+                    combined_entries.append((item.payload, item.metadata()))
+            for random_payload, metadata in random_entries:
+                if random_payload not in seen_payloads:
+                    seen_payloads.add(random_payload)
+                    combined_entries.append((random_payload, metadata))
+                if len(combined_entries) == count:
+                    break
+        if len(combined_entries) != count:
+            raise RuntimeError(
+                f"guided/random 결합 후 mutation {count}개 중 "
+                f"{len(combined_entries)}개만 생성됐습니다."
+            )
+        payloads = [item for item, _ in combined_entries]
+        mutation_metadata = {
+            item: metadata for item, metadata in combined_entries
+        }
         for item in payloads:
             validate_length(item, is_fd)
     else:
@@ -609,7 +735,7 @@ def run(args: argparse.Namespace) -> int:
 
     mode_name = "RAW" if raw_mode else "DBC PATCH"
     if mutation_enabled:
-        mode_name += " + REPOSITORY MUTATOR"
+        mode_name += " + LOCAL MUTATOR"
     print(f"[MODE]  {mode_name} / {'EXECUTE' if execute else 'PREVIEW'}")
     print(f"[BUS]   {interface_name}:{channel} ({bus_name})")
     print(f"[FRAME] ID=0x{frame_id:X}, DLC={len(payload)}, DATA={payload.hex().upper()}")
@@ -634,6 +760,14 @@ def run(args: argparse.Namespace) -> int:
             f"include_seed={include_original}, random_seed={random_seed}"
             f" ({'auto' if random_seed_generated else 'fixed'})"
         )
+        print(
+            f"[MUT]   bit_operation_ratio={bit_operation_ratio:g}, "
+            f"guided={len(guided_entries)}/{len(payloads)}"
+        )
+        if feedback_path is not None:
+            print(
+                f"[FEEDBACK] {feedback_path} / usable_hints={len(feedback_hints)}"
+            )
     print(f"[LOG]   {output_path}")
     print(f"[LOG]   policy={output_policy}, experiment_id={experiment_id or '-'}")
     if not execute:
@@ -689,6 +823,15 @@ def run(args: argparse.Namespace) -> int:
                         "include_original": include_original,
                         "random_seed": random_seed,
                         "random_seed_generated": random_seed_generated,
+                        "bit_operation_ratio": bit_operation_ratio,
+                        "feedback_path": str(feedback_path) if feedback_path else None,
+                        "guided_ratio": guided_ratio,
+                        "feedback_hint_count": len(feedback_hints),
+                        "guided_payload_count": len(guided_entries),
+                        "trial_mutation_id": args.mutation_id,
+                        "parent_mutation_id": args.parent_mutation_id,
+                        "generation_reason": args.generation_reason,
+                        "explicit_trial_payload": explicit_mutation is not None,
                     },
                 },
             )
@@ -738,6 +881,8 @@ def run(args: argparse.Namespace) -> int:
                         mutation_summary(mutation_base, current_payload)
                         if mutated else None
                     )
+                    if details is not None:
+                        details.update(mutation_metadata.get(current_payload, {}))
                     record_signals = (
                         assignments if assignments and not campaign_enabled else None
                     )

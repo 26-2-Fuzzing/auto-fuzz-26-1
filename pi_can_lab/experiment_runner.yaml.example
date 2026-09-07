@@ -1,0 +1,60 @@
+# Copy to experiment_runner.yaml and set the three SSH destinations.
+experiments_root: experiments
+dbc: ../A5.dbc
+sender_config: sender_trial.yaml
+
+remote:
+  project_dir: /home/pi/auto-fuzz-26/pi_can_lab
+  python: python3
+  capture_root: /tmp/auto_fuzz_trials
+  hosts:
+    p_can:
+      host: 192.168.10.21
+      user: pi
+      key_filename: /home/control/.ssh/id_ed25519
+    b_can:
+      host: 192.168.10.22
+      user: pi
+      key_filename: /home/control/.ssh/id_ed25519
+    i_can:
+      host: 192.168.10.23
+      user: pi
+      key_filename: /home/control/.ssh/id_ed25519
+
+target:
+  channel: can0
+  probe_live_payload: true
+  probe_samples: 3
+  probe_timeout_seconds: 6
+  # Used only if live candump probing fails. Remove to fail closed instead.
+  reference_payload: "00 00 00 00 20 00 00 F0"
+
+trial:
+  capture_start_delay_seconds: 1.0
+  baseline_seconds: 10.0
+  normal_seconds: 5.0
+  mutation_seconds: 5.0
+  post_seconds: 10.0
+  runner_timeout_seconds: 120.0
+
+time_sync:
+  samples: 3
+  warning_threshold_ms: 50.0
+
+anomaly_thresholds:
+  minimum_baseline_frames: 5
+  minimum_timing_intervals: 3
+  new_message_minimum_frames: 3
+  timing_relative_change: 0.25
+  frequency_relative_change: 0.50
+  message_loss_ratio: 0.10
+  payload_novel_ratio: 0.20
+
+feedback:
+  interesting_score_threshold: 0.60
+  bit_operation_ratio: 0.75
+  max_operations: 1
+  no_anomaly:
+    exploration_probability: 0.80
+  interesting:
+    exploitation_probability: 0.70

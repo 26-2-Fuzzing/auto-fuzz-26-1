@@ -57,6 +57,10 @@ python3 pi_can_lab/can_sender.py \
 분석기는 phase tag가 있으면 normal 송신을 stimulus에서 제외하고 mutation만
 비교합니다.
 
+독립된 Raspberry Pi 사이에서 mutation 피드백은 다음 회차에 적용합니다. 첫 회차의 B-CAN
+TX와 I/P-CAN RX 로그를 한 PC에서 분석한 뒤 생성된 JSON을 B-CAN 송신 장비로 복사합니다.
+같은 회차 중에 수신 장비가 송신 장비를 제어하는 구조는 사용하지 않습니다.
+
 ## TX 상관분석 보고서
 
 각 장비의 해당 회차 파일을 한 PC로 모은 다음 실행합니다. `--output`을 생략하면 분석할
@@ -85,6 +89,38 @@ python3 pi_can_lab/analyze_fuzz_response.py \
 CRC, 정상 센서 변동으로 인한 신규 payload는 안정 비트와 DBC 신호 기준으로 걸러 냅니다.
 낮은 신뢰도 후보는 보고서에 참고용으로 남지만 최종 `반응 후보 관측` 개수에는 포함하지
 않습니다.
+
+## 이상반응 연계 mutation
+
+분석 JSON의 `mutation_anomaly_mappings`는 각 반응 후보에 가장 가까운 선행 TX를 연결하고,
+`anomaly_type`과 `source_mutation`에 sequence, payload, mutation 연산, 지연 시간을
+기록합니다. B-CAN 송신 장비의 `pi_can_lab` 디렉터리에서 다음 회차를 preview합니다.
+
+```bash
+./lab tx --feedback logs/fuzz_response_1.json
+```
+
+preview에 표시된 seed로 실제 회차를 재현합니다.
+
+```bash
+./lab tx --feedback logs/fuzz_response_1.json \
+  --random-seed SEED --execute
+```
+
+기본 random mutation은 bit 단위 연산 75%, byte 단위 연산 25%로 선택합니다. feedback이
+있으면 corpus의 최대 50%를 다음 guided 전략으로 만들고 나머지는 random 탐색으로 둡니다.
+
+| 이상반응 유형 | 다음 mutation 전략 |
+|---|---|
+| timing | 관련 byte의 인접값과 경계값 탐색 |
+| new message | 변경 bit/byte를 되돌려 최소 trigger 탐색 |
+| message disappearance | 원 mutation 재현 및 bit/byte 복원 |
+| payload/signal | 변경 field의 byte/bit 국소화 |
+| cross-bus | 원 mutation 재현 후보 우선 포함 |
+
+이 매핑은 10ms 간격의 연속 TX에서 가장 가까운 선행 mutation을 연결한 시간적 후보입니다.
+여러 mutation의 누적 효과나 차량 내부 지연이 있을 수 있으므로 인과관계로 확정하지 마십시오.
+guided 후보는 원인을 증명하는 결과가 아니라 다음 재현 실험의 입력입니다.
 
 ## 유의미한 퍼징 결과의 조건
 

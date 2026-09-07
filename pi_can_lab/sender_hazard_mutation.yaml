@@ -10,7 +10,7 @@ sender:
 
   # A5.dbc: Blinkmodi_02, standard ID 0x366, DLC 8.
   # live payload를 정상 0x366으로 캡처하고 그 payload 자체를
-  # 상위 저장소 src.mutation.mutator.Mutator의 seed로 사용합니다.
+  # pi_can_lab/mutation_engine.py의 Mutator seed로 사용합니다.
   message: Blinkmodi_02
   id: 0x366
   # 기본 seed_source=normal에서는 아래 patch를 mutation seed로 쓰지 않습니다.
@@ -30,9 +30,16 @@ sender:
     max_operations: 3
     allow_dlc_change: false
     include_original: false
+    # Random exploration은 세밀한 bit 연산을 75%, byte 연산을 25%로 선택합니다.
+    bit_operation_ratio: 0.75
     # null이면 매 실행마다 새 seed를 만들고 TX manifest에 기록합니다.
     # 유의미한 회차를 재현할 때는 그 manifest의 seed를 --random-seed로 지정하십시오.
     random_seed: null
+    feedback:
+      # 이전 analyze_fuzz_response.py JSON을 사용하려면 CLI --feedback으로 지정합니다.
+      path: null
+      # usable anomaly mapping이 있을 때 corpus의 최대 절반을 type-guided 후보로 구성합니다.
+      guided_ratio: 0.5
 
   campaign:
     enabled: true

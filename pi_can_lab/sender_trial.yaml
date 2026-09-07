@@ -1,0 +1,39 @@
+bus:
+  interface: socketcan
+  channel: can0
+
+sender:
+  # experiment_runner.py overrides bus_name, ID, original data and output.
+  bus_name: b_can
+  output: logs/trial_tx.jsonl
+  output_policy: fail
+
+  mutation:
+    enabled: true
+    seed_source: normal
+    max_operations: 1
+    allow_dlc_change: false
+    include_original: false
+    bit_operation_ratio: 0.75
+
+  campaign:
+    enabled: true
+    baseline_duration_seconds: 10.0
+    normal_duration_seconds: 5.0
+    mutation_duration_seconds: 5.0
+    recovery_duration_seconds: 10.0
+
+  transmit:
+    count: 1
+    interval_ms: 10.0
+    send_timeout_seconds: 1.0
+    restore_original: true
+    restore_count: 1
+    restore_delay_ms: 100.0
+
+  safety:
+    max_count: 1
+    max_duration_seconds: 30.0
+    max_campaign_duration_seconds: 120.0
+    min_interval_ms: 10.0
+    allow_protected_dbc_patch: false

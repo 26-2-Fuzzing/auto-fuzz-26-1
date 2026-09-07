@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import math
+import signal
 import sys
+import threading
 import time
 import uuid
 from collections import Counter, defaultdict
@@ -360,6 +362,17 @@ def run(args: argparse.Namespace) -> int:
     report_last_values: Dict[Tuple[int, str], Any] = {}
     max_capture_lag_ns: Optional[int] = None
     last_values: Dict[Tuple[int, str], Any] = {}
+    stop_requested = False
+    previous_sigterm = None
+
+    def request_stop(signum: int, frame: Any) -> None:
+        del signum, frame
+        nonlocal stop_requested
+        stop_requested = True
+
+    if threading.current_thread() is threading.main_thread():
+        previous_sigterm = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGTERM, request_stop)
 
     def session_end_record(reason: str) -> Dict[str, Any]:
         return {
@@ -420,7 +433,10 @@ def run(args: argparse.Namespace) -> int:
             )
             handle.flush()
 
-            while duration <= 0 or (time.monotonic() - started_mono) < duration:
+            while (
+                not stop_requested
+                and (duration <= 0 or (time.monotonic() - started_mono) < duration)
+            ):
                 message = bus.recv(timeout=recv_timeout)
                 now_mono = time.monotonic()
                 if message is None:
@@ -542,7 +558,10 @@ def run(args: argparse.Namespace) -> int:
                     print(f"[STATS] received={total}, logged={logged}, decoded={decoded_count}, errors={decode_errors}")
                     last_stats = now_mono
 
-            write_jsonl(handle, session_end_record("duration_complete"))
+            write_jsonl(
+                handle,
+                session_end_record("remote_stop" if stop_requested else "duration_complete"),
+            )
             handle.flush()
     except KeyboardInterrupt:
         print("\n[STOP] 사용자 중지")
@@ -550,6 +569,8 @@ def run(args: argparse.Namespace) -> int:
             write_jsonl(handle, session_end_record("user_interrupt"))
             handle.flush()
     finally:
+        if previous_sigterm is not None:
+            signal.signal(signal.SIGTERM, previous_sigterm)
         if bus is not None:
             shutdown_bus(bus)
 

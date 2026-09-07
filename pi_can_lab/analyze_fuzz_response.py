@@ -105,6 +105,7 @@ def load_tx_events(path: Path) -> List[Dict[str, Any]]:
             "kind": record.get("kind", "mutation"),
             "phase": record.get("phase"),
             "mutation": record.get("mutation"),
+            "source_bus": record.get("bus", "unknown"),
             "tx_session_id": record.get("tx_session_id"),
             "experiment_id": record.get("experiment_id"),
         })
@@ -381,6 +382,20 @@ def first_stable_change_latency_ms(
     mask: bytes,
     tx_events: Sequence[Dict[str, Any]],
 ) -> Optional[float]:
+    evidence = nearest_stable_change_source(
+        events, key, reference, mask, tx_events
+    )
+    return evidence["latency_ms"] if evidence else None
+
+
+def nearest_stable_change_source(
+    events: Sequence[Dict[str, Any]],
+    key: FrameKey,
+    reference: Optional[bytes],
+    mask: bytes,
+    tx_events: Sequence[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Map changed RX evidence to the nearest preceding mutation TX."""
     changed_times = []
     for event in events:
         if (event["arbitration_id"], event["is_extended_id"]) != key:
@@ -397,13 +412,32 @@ def first_stable_change_latency_ms(
             for before, observed, stable in zip(reference, payload, mask)
         ):
             changed_times.append(event["time_ns"])
-    latencies = [
-        changed - tx["time_ns"]
-        for changed in changed_times
-        for tx in tx_events
-        if tx["time_ns"] <= changed
-    ]
-    return min(latencies) / 1_000_000.0 if latencies else None
+    if not changed_times or not tx_events:
+        return None
+
+    tx_times = [event["time_ns"] for event in tx_events]
+    best: Optional[Tuple[int, Dict[str, Any], int]] = None
+    for changed_time in changed_times:
+        index = bisect.bisect_right(tx_times, changed_time) - 1
+        if index < 0:
+            continue
+        tx = tx_events[index]
+        latency_ns = changed_time - tx["time_ns"]
+        if best is None or latency_ns < best[0]:
+            best = (latency_ns, tx, changed_time)
+    if best is None:
+        return None
+
+    latency_ns, tx, changed_time = best
+    return {
+        "source_bus": tx.get("source_bus", "unknown"),
+        "sequence": tx["sequence"],
+        "payload": tx["payload"].hex().upper(),
+        "mutation": tx.get("mutation"),
+        "mapping_method": "nearest_preceding_tx",
+        "latency_ms": latency_ns / 1_000_000.0,
+        "rx_change_time_ns": changed_time,
+    }
 
 
 def direct_correlations(
@@ -507,9 +541,10 @@ def analyse_bus(
         signal_evidence = stable_signal_evidence(
             database, key, base_counts, stimulus_counts, recovery_counts
         )
-        latency_ms = first_stable_change_latency_ms(
+        source_evidence = nearest_stable_change_source(
             stimulus_events, key, reference, stable_mask, tx_events
         )
+        latency_ms = source_evidence["latency_ms"] if source_evidence else None
         expected_stimulus_frames = baseline_rate * stimulus_seconds
         rate_changed = (
             len(base_counts) >= 1
@@ -597,11 +632,31 @@ def analyse_bus(
                 confidence = "medium"
             else:
                 confidence = "low"
+        if not base_counts:
+            anomaly_type = "new_message"
+        elif sum(stimulus_counts.values()) == 0 or (
+            rate_ratio is not None and rate_ratio <= 0.1
+        ):
+            anomaly_type = "message_disappearance"
+        elif rate_changed:
+            anomaly_type = "timing"
+        elif signal_evidence or stable_bits["changed_frames"]:
+            anomaly_type = "payload_signal"
+        else:
+            anomaly_type = "transport" if is_transport else "generic"
+        mapped_source = (
+            source_evidence
+            if source_evidence is not None
+            and source_evidence["latency_ms"]
+            <= reaction_window_ns / 1_000_000
+            else None
+        )
         candidates.append({
             "can_id": can_id,
             "score": score,
             "candidate_type": candidate_type,
             "confidence": confidence,
+            "anomaly_type": anomaly_type,
             "reasons": reasons,
             "baseline_frames": sum(base_counts.values()),
             "baseline_unique_payloads": len(base_counts),
@@ -623,12 +678,25 @@ def analyse_bus(
             "novel_direct_tx_matches": novel_direct_by_id[can_id],
             "baseline_mode_payload": reference.hex().upper() if reference else None,
             "novel_payload_samples": sample_details,
+            "source_mutation": mapped_source if not is_transport else None,
         })
 
     candidates.sort(key=lambda item: (-item["score"], item["can_id"]))
     reactions = [
         candidate for candidate in candidates
         if candidate["candidate_type"] == "reaction"
+    ]
+    mutation_anomaly_mappings = [
+        {
+            "source_mutation": candidate["source_mutation"],
+            "target_bus": bus_name,
+            "target_id": candidate["can_id"],
+            "anomaly_type": candidate["anomaly_type"],
+            "confidence": candidate["confidence"],
+            "score": candidate["score"],
+        }
+        for candidate in reactions
+        if candidate.get("source_mutation") is not None
     ]
     analysis_events = phase_events(rx_events, baseline_start_ns, recovery_end_ns)
     window_errors = phase_events(rx_errors, baseline_start_ns, recovery_end_ns)
@@ -703,6 +771,7 @@ def analyse_bus(
         "direct_correlation": direct,
         "candidates": candidates,
         "reaction_candidates": reactions,
+        "mutation_anomaly_mappings": mutation_anomaly_mappings,
         "suppressed_dynamic_novel_id_count": len(novel_ids - ranked_reaction_keys),
         "verdict": {
             "label": label,
@@ -758,8 +827,8 @@ def markdown_report(result: Mapping[str, Any]) -> str:
             "",
             "### 기능 반응 후보",
             "",
-            "| 신뢰도 | Score | CAN ID | 근거 | 최초 지연 | 안정 비트 원복 | DBC 신호 |",
-            "|---|---:|---|---|---:|---:|---|",
+            "| 신뢰도 | Type | CAN ID | Source mutation | 근거 | 최초 지연 | 안정 비트 원복 |",
+            "|---|---|---|---|---|---:|---:|",
         ])
         for candidate in bus["reaction_candidates"][:30]:
             latency = candidate["first_change_latency_ms"]
@@ -769,13 +838,19 @@ def markdown_report(result: Mapping[str, Any]) -> str:
             signals = ", ".join(
                 item["signal"] for item in candidate["stable_signal_evidence"][:5]
             ) or "-"
+            source = candidate.get("source_mutation")
+            source_text = (
+                f"seq {source['sequence']}"
+                if source is not None else "-"
+            )
             lines.append(
-                f"| {candidate['confidence']} | {candidate['score']} | `{candidate['can_id']}` | "
-                f"{'; '.join(candidate['reasons'])} | {latency_text} | "
-                f"{recovery_text} | {signals} |"
+                f"| {candidate['confidence']} | {candidate['anomaly_type']} | "
+                f"`{candidate['can_id']}` | {source_text} | "
+                f"{'; '.join(candidate['reasons'])}; signals={signals} | "
+                f"{latency_text} | {recovery_text} |"
             )
         if not bus["reaction_candidates"]:
-            lines.append("| - | - | - | 기능 반응 후보 없음 | - | - | - |")
+            lines.append("| - | - | - | - | 기능 반응 후보 없음 | - | - |")
         lines.extend([
             "",
             f"정상 rolling counter/CRC 등으로 보이는 단순 신규 payload ID "
@@ -795,6 +870,7 @@ def markdown_report(result: Mapping[str, Any]) -> str:
         "- 주입 payload 직접 일치는 프레임이 해당 버스에서 관찰됐다는 근거이며, 기능 동작 자체의 증거는 아닙니다.",
         "- 반응 후보는 baseline에서 안정적이던 비트/DBC 신호, 신규 ID, 주기 변화를 기준으로 추렸습니다.",
         "- 후보는 인과관계의 증명이 아닙니다. 같은 입력을 3회 이상 반복하고 no-op 대조군에서도 재현되는지 비교하십시오.",
+        "- Source mutation은 연속 송신 중 변화 직전의 가장 가까운 TX를 연결한 휴리스틱입니다. 10ms 연속 송신에서는 인과관계가 확정되지 않으므로 guided 후보를 별도 반복 검증하십시오.",
         "- CAN 로그만으로 램프·모터 등 물리 동작을 증명할 수 없습니다. 영상, 전류, GPIO 같은 별도 oracle을 함께 기록하십시오.",
         "- 음수 지연은 장비 간 시계 오차일 수 있으므로 모든 호스트의 NTP/chrony 동기화가 필요합니다.",
         "",

@@ -47,6 +47,17 @@ class NumberedOutputTests(unittest.TestCase):
         self.assertEqual(campaign["mutation_duration_seconds"], 60.0)
         self.assertGreater(campaign["recovery_duration_seconds"], 0)
 
+    def test_trial_sender_is_single_case_and_dbc_independent(self) -> None:
+        root = Path(__file__).resolve().parent
+        sender = yaml.safe_load(
+            (root / "sender_trial.yaml").read_text(encoding="utf-8")
+        )["sender"]
+        self.assertTrue(sender["mutation"]["enabled"])
+        self.assertEqual(sender["transmit"]["count"], 1)
+        self.assertEqual(sender["safety"]["max_count"], 1)
+        self.assertNotIn("dbc", sender)
+        self.assertNotIn("set", sender)
+
 
 class CaptureReportTests(unittest.TestCase):
     def test_socketcan_rx_overflow_is_human_readable(self) -> None:

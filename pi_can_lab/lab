@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+"""Short role-based launcher for the distributed Raspberry Pi CAN lab."""
+
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+from typing import Sequence
+
+
+LAB_DIR = Path(__file__).resolve().parent
+RECEIVER_CONFIGS = {
+    "b": "receiver_b_can.yaml",
+    "c": "receiver_c_can.yaml",
+    "i": "receiver_i_can.yaml",
+    "p": "receiver_p_can.yaml",
+}
+SENDER_CONFIGS = {
+    "mutation": "sender_hazard_mutation.yaml",
+    "button": "sender_hazard_button.yaml",
+    "status": "sender_hazard_status.yaml",
+}
+
+
+USAGE = """Usage:
+  ./pi_can_lab/lab rx {b|c|i|p} [receiver options]
+  ./pi_can_lab/lab tx [mutation|button|status|raw] [sender options]
+
+Common commands:
+  ./pi_can_lab/lab rx i
+  ./pi_can_lab/lab rx p
+  ./pi_can_lab/lab tx
+  ./pi_can_lab/lab tx --execute
+
+`tx` defaults to the hazard mutation preset and remains preview-only unless
+--execute is explicitly supplied. Extra options are passed to can_receiver.py
+or can_sender.py unchanged.
+"""
+
+
+def build_command(argv: Sequence[str]) -> list[str]:
+    """Translate a short role command into the existing sender/receiver CLI."""
+    args = list(argv)
+    if not args or args[0] in {"-h", "--help", "help"}:
+        raise SystemExit(USAGE)
+
+    role = args.pop(0).lower()
+    if role == "rx":
+        if not args or args[0] in {"-h", "--help", "help"}:
+            raise SystemExit("Receiver usage:\n  ./pi_can_lab/lab rx {b|c|i|p} [receiver options]")
+        bus_name = args.pop(0).lower().removesuffix("-can").removesuffix("_can")
+        config_name = RECEIVER_CONFIGS.get(bus_name)
+        if config_name is None:
+            raise ValueError(f"unknown receiver bus: {bus_name!r}; choose b, c, i, or p")
+        script_name = "can_receiver.py"
+    elif role == "tx":
+        mode = "mutation"
+        if args and not args[0].startswith("-"):
+            mode = args.pop(0).lower()
+        config_name = SENDER_CONFIGS.get(mode)
+        if config_name is None and mode != "raw":
+            raise ValueError(
+                f"unknown sender preset: {mode!r}; choose mutation, button, status, or raw"
+            )
+        script_name = "can_sender.py"
+    else:
+        raise ValueError(f"unknown role: {role!r}; choose rx or tx")
+
+    if "--config" in args:
+        raise ValueError("lab presets choose --config automatically; remove --config")
+
+    command = [sys.executable, str(LAB_DIR / script_name)]
+    if config_name is not None:
+        command.extend(["--config", str(LAB_DIR / config_name)])
+    command.extend(args)
+    return command
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    try:
+        command = build_command(sys.argv[1:] if argv is None else argv)
+    except SystemExit as exc:
+        print(exc)
+        return 0
+    except ValueError as exc:
+        print(f"lab: {exc}", file=sys.stderr)
+        print(USAGE, file=sys.stderr)
+        return 2
+
+    os.execv(command[0], command)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
