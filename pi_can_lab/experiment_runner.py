@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
+from a5_0x366_mutator import A5BlinkmodiMutator, PROFILE_FAMILIES
 from can_common import ConfigurationError, load_dbc, load_yaml_config, parse_can_data, parse_int
 from experiment_store import ExperimentStore
 from mutation_feedback import create_trial_feedback
@@ -220,7 +221,11 @@ class ExperimentRunner:
             "--count", "1",
             "--mutation-data", mutation.mutated_payload.hex(),
             "--mutation-id", str(mutation.mutation_id),
+            "--mutation-uid", mutation.mutation_uid,
             "--mutation-operator", mutation.operator,
+            "--mutation-metadata-json", json.dumps(
+                mutation.parameters, ensure_ascii=True, separators=(",", ":")
+            ),
             "--generation-reason", mutation.generation_reason,
             "--random-seed", str(mutation.random_seed),
             "--baseline-duration", str(float(trial_cfg.get("baseline_seconds", 10.0))),
@@ -243,6 +248,8 @@ class ExperimentRunner:
         selector: TrialStrategySelector,
         dbc_path: Optional[Path],
         reproduce_mutation_id: Optional[int] = None,
+        mutation_profile: Optional[str] = None,
+        undefined_max_bits: int = 2,
     ) -> dict[str, Any]:
         state = store.load_feedback_state()
         state = {**state, "next_mutation_id": store.next_mutation_id()}
@@ -297,6 +304,9 @@ class ExperimentRunner:
                 mutation, decision = selector.select_mutation(
                     state=state, original_payload=original, source_bus=source_bus,
                     can_id=can_id, random_seed=random_seed,
+                    mutation_profile=mutation_profile,
+                    dbc_path=dbc_path,
+                    undefined_max_bits=undefined_max_bits,
                 )
             signal = dbc_signal_metadata(mutation, dbc_path)
             if signal is not None:
@@ -445,6 +455,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trials", type=int, default=1, help="number of new completed trials")
     parser.add_argument("--random-seed", type=int, default=366)
     parser.add_argument("--reproduce-mutation-id", type=int, help="repeat one completed mutation exactly")
+    parser.add_argument(
+        "--mutation-profile", choices=tuple(PROFILE_FAMILIES),
+        help="DBC-driven 0x366 campaign; omitted preserves the existing generic mutator",
+    )
+    parser.add_argument(
+        "--undefined-max-bits", type=int, default=2,
+        help="maximum changed bits in an undefined_bit_multi case (default: 2)",
+    )
+    parser.add_argument(
+        "--print-0x366-map", action="store_true",
+        help="print the DBC-derived 64-bit occupancy and enum report, then exit",
+    )
     parser.add_argument("--execute", action="store_true", help="connect over SSH and transmit CAN frames")
     return parser
 
@@ -452,12 +474,9 @@ def build_parser() -> argparse.ArgumentParser:
 def run(args: argparse.Namespace) -> int:
     if args.trials < 1:
         raise ConfigurationError("trials must be at least 1")
+    if args.undefined_max_bits < 2:
+        raise ConfigurationError("undefined-max-bits must be at least 2")
     config, config_path = load_yaml_config(args.config)
-    if not args.execute:
-        print("[SAFE] Preview only: no SSH connection or CAN transmission was started.")
-        print("[SAFE] Add --execute after reviewing experiment_runner.yaml and the isolated bench.")
-        return 0
-    source_bus = normalize_bus(args.source_bus)
     target_id = parse_int(args.target_id, "target ID")
     root_value = config.get("experiments_root", "experiments")
     root = Path(root_value).expanduser()
@@ -470,9 +489,31 @@ def run(args: argparse.Namespace) -> int:
     if not dbc_path.is_absolute() and config_path is not None:
         dbc_path = config_path.parent / dbc_path
     dbc_path = dbc_path.resolve() if dbc_value else None
+    if args.print_0x366_map:
+        if dbc_path is None:
+            raise ConfigurationError("--print-0x366-map requires dbc in runner config")
+        target = A5BlinkmodiMutator(dbc_path)
+        print(target.occupancy_text())
+        print("\nDBC timing")
+        print(json.dumps(target.timing, ensure_ascii=False, indent=2))
+        print("\nUndefined enum report")
+        print(json.dumps(target.enum_report(), ensure_ascii=False, indent=2))
+        return 0
+    if args.mutation_profile is not None and target_id != 0x366:
+        raise ConfigurationError("--mutation-profile is dedicated to CAN ID 0x366")
+    if not args.execute:
+        print("[SAFE] Preview only: no SSH connection or CAN transmission was started.")
+        print("[SAFE] Add --execute after reviewing experiment_runner.yaml and the isolated bench.")
+        if args.mutation_profile:
+            print(f"[PROFILE] {args.mutation_profile} / undefined-max-bits={args.undefined_max_bits}")
+        return 0
+    source_bus = normalize_bus(args.source_bus)
     snapshot = {
         "target_id": f"0x{target_id:X}", "source_bus": source_bus.upper(),
-        "random_seed": args.random_seed, "runner_config": config,
+        "random_seed": args.random_seed,
+        "mutation_profile": args.mutation_profile,
+        "undefined_max_bits": args.undefined_max_bits,
+        "runner_config": config,
     }
     store = ExperimentStore(root, experiment_id, snapshot)
     reconciled = store.reconcile_analyzed_trials()
@@ -487,6 +528,8 @@ def run(args: argparse.Namespace) -> int:
                 store=store, source_bus=source_bus, can_id=target_id,
                 random_seed=args.random_seed, selector=selector, dbc_path=dbc_path,
                 reproduce_mutation_id=args.reproduce_mutation_id,
+                mutation_profile=args.mutation_profile,
+                undefined_max_bits=args.undefined_max_bits,
             )
         store.complete()
     finally:

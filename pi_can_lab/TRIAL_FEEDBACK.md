@@ -65,10 +65,16 @@ python3 experiment_runner.py --target-id 0x366 --source-bus B_CAN --trials 20
 python3 experiment_runner.py \
   --target-id 0x366 \
   --source-bus B_CAN \
+  --mutation-profile all-0x366 \
+  --undefined-max-bits 2 \
   --trials 20 \
   --random-seed 366 \
   --execute
 ```
+
+`--mutation-profile`을 생략하면 기존 generic mutation engine을 그대로 사용합니다. 전용 profile은
+`signal-aware`, `undefined-only`, `semantic-plus-undefined`, `temporal`, `all-0x366`이며 상세
+occupancy/enum/case 정의는 `A5_0X366_MUTATIONS.md`를 참고합니다.
 
 `--source-bus P_CAN` 또는 `I_CAN`도 지원하지만, 실제 배선과 주입 권한이 있는 Pi인지 먼저
 확인해야 합니다. 기존 experiment를 이어가려면 `--experiment-id 42`를 추가합니다. 실패한

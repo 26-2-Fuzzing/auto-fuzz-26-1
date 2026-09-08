@@ -54,9 +54,15 @@ class MutationCase:
     def changed_bits(self) -> tuple[tuple[int, int], ...]:
         return changed_locations(self.original_payload, self.mutated_payload)[1]
 
+    @property
+    def mutation_uid(self) -> str:
+        """Stable human-readable label without breaking numeric state IDs."""
+        return f"MUT-{self.mutation_id:06d}"
+
     def to_dict(self) -> dict[str, Any]:
         result = asdict(self)
         result.update({
+            "mutation_uid": self.mutation_uid,
             "source_bus": self.source_bus.upper(),
             "can_id": f"0x{self.can_id:X}",
             "original_payload": " ".join(f"{value:02X}" for value in self.original_payload),

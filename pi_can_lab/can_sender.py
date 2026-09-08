@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import random
 import secrets
@@ -74,8 +75,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--random-seed", type=int, help="재현 가능한 mutation 난수 seed")
     parser.add_argument("--mutation-data", help="Trial runner가 선택한 단일 mutation payload")
     parser.add_argument("--mutation-id", type=int, help="Trial mutation 고유 ID")
+    parser.add_argument("--mutation-uid", help="사람이 추적할 MUT-000001 형식 ID")
     parser.add_argument("--parent-mutation-id", type=int, help="Feedback parent mutation ID")
     parser.add_argument("--mutation-operator", help="명시적 Trial mutation operator")
+    parser.add_argument(
+        "--mutation-metadata-json",
+        help="Trial runner가 전달하는 signal/undefined/sequence provenance JSON",
+    )
     parser.add_argument("--generation-reason", help="Feedback 기반 mutation 생성 이유")
     parser.add_argument("--feedback", help="이전 analyze_fuzz_response.py JSON 결과")
     parser.add_argument("--guided-ratio", type=float, help="guided mutation 비율(0~1)")
@@ -370,8 +376,9 @@ def tx_record(
     experiment_id: Optional[str] = None,
     phase: Optional[str] = None,
 ) -> Dict[str, Any]:
-    return {
+    record = {
         "record_type": "can_tx",
+        "schema_version": 3,
         **now_fields(),
         "host": hostname(),
         "bus": bus_name,
@@ -392,6 +399,24 @@ def tx_record(
         "signals": signals,
         "mutation": mutation,
     }
+    if mutation is not None:
+        # Flat manifest fields make cross-bus joins possible without coupling
+        # analyzers to the complete nested mutation schema.
+        record.update({
+            "mutation_id": mutation.get("mutation_uid") or mutation.get("mutation_id"),
+            "mutation_numeric_id": mutation.get("mutation_id"),
+            "timestamp": record["wall_time"],
+            "timestamp_ns": record["wall_time_ns"],
+            "interface": channel,
+            "can_id": f"0x{frame_id:X}",
+            "payload": payload.hex().upper(),
+            "mutation_family": mutation.get("mutation_family"),
+            "case": mutation.get("case"),
+            "signals_changed": mutation.get("signals_changed", []),
+            "undefined_bits_changed": mutation.get("undefined_bits_changed", []),
+            "undefined_enum": mutation.get("undefined_enum"),
+        })
+    return record
 
 
 def run(args: argparse.Namespace) -> int:
@@ -428,6 +453,15 @@ def run(args: argparse.Namespace) -> int:
     random_seed_value = choose(args.random_seed, mutation_cfg.get("random_seed"), None)
     configured_random_seed = int(random_seed_value) if random_seed_value is not None else None
     random_seed, random_seed_generated = resolve_random_seed(configured_random_seed)
+    explicit_metadata: Dict[str, Any] = {}
+    if args.mutation_metadata_json:
+        try:
+            loaded_metadata = json.loads(args.mutation_metadata_json)
+        except json.JSONDecodeError as exc:
+            raise ConfigurationError("mutation metadata JSON이 올바르지 않습니다.") from exc
+        if not isinstance(loaded_metadata, dict):
+            raise ConfigurationError("mutation metadata JSON은 object여야 합니다.")
+        explicit_metadata = loaded_metadata
     bit_operation_ratio = float(choose(
         args.bit_operation_ratio,
         mutation_cfg.get("bit_operation_ratio"),
@@ -682,8 +716,10 @@ def run(args: argparse.Namespace) -> int:
                     "strategy": "previous_trial_feedback",
                     "operators": [args.mutation_operator or "EXPLICIT"],
                     "mutation_id": args.mutation_id,
+                    "mutation_uid": args.mutation_uid,
                     "parent_mutation_id": args.parent_mutation_id,
                     "generation_reason": args.generation_reason,
+                    **explicit_metadata,
                 },
             )]
         else:
@@ -728,10 +764,43 @@ def run(args: argparse.Namespace) -> int:
         mutation_metadata = {
             item: metadata for item, metadata in combined_entries
         }
+        sequence_spec = explicit_metadata.get("sequence")
+        sequence_payloads: Optional[List[bytes]] = None
+        sequence_interval_ms: Optional[float] = None
+        if sequence_spec is not None:
+            if not isinstance(sequence_spec, dict):
+                raise ConfigurationError("temporal sequence metadata는 object여야 합니다.")
+            raw_frames = sequence_spec.get("frames")
+            if not isinstance(raw_frames, list) or not raw_frames:
+                raise ConfigurationError("temporal sequence frames가 비어 있습니다.")
+            sequence_payloads = [parse_can_data(str(value)) for value in raw_frames]
+            frame_changes = sequence_spec.get("frame_signals_changed", [])
+            if frame_changes and (
+                not isinstance(frame_changes, list)
+                or len(frame_changes) != len(sequence_payloads)
+            ):
+                raise ConfigurationError(
+                    "temporal frame_signals_changed 길이가 frames와 다릅니다."
+                )
+            for index, sequence_payload in enumerate(sequence_payloads):
+                validate_length(sequence_payload, is_fd, len(mutation_base))
+                frame_metadata = dict(combined_entries[0][1])
+                if frame_changes:
+                    frame_metadata["signals_changed"] = frame_changes[index]
+                    frame_metadata["sequence_frame_index"] = index
+                mutation_metadata[sequence_payload] = frame_metadata
+            sequence_interval_ms = float(sequence_spec.get("interval_ms", interval_ms))
+            validate_finite(sequence_interval_ms, "temporal sequence interval_ms", allow_equal=False)
+            if sequence_interval_ms < min_interval_ms:
+                raise ConfigurationError(
+                    f"temporal interval은 안전 제한 {min_interval_ms:g}ms 이상이어야 합니다."
+                )
         for item in payloads:
             validate_length(item, is_fd)
     else:
         payloads = [payload] * count
+        sequence_payloads = None
+        sequence_interval_ms = None
 
     mode_name = "RAW" if raw_mode else "DBC PATCH"
     if mutation_enabled:
@@ -791,7 +860,7 @@ def run(args: argparse.Namespace) -> int:
                 handle,
                 {
                     "record_type": "tx_session_start",
-                    "schema_version": 2,
+                    "schema_version": 3,
                     **now_fields(),
                     "host": hostname(),
                     "bus": bus_name,
@@ -831,8 +900,10 @@ def run(args: argparse.Namespace) -> int:
                         "feedback_hint_count": len(feedback_hints),
                         "guided_payload_count": len(guided_entries),
                         "trial_mutation_id": args.mutation_id,
+                        "trial_mutation_uid": args.mutation_uid,
                         "parent_mutation_id": args.parent_mutation_id,
                         "generation_reason": args.generation_reason,
+                        "targeted_metadata": explicit_metadata or None,
                         "explicit_trial_payload": explicit_mutation is not None,
                     },
                 },
@@ -866,13 +937,17 @@ def run(args: argparse.Namespace) -> int:
                 phase_payloads: Sequence[bytes],
                 phase_duration: Optional[float],
                 mutated: bool,
+                phase_interval_ms: Optional[float] = None,
             ) -> None:
                 nonlocal attempted_count
                 marker_duration = phase_duration or 0.0
                 phase_marker(phase, "start", marker_duration)
                 active_duration = phase_duration if execute else None
+                selected_interval_ms = (
+                    phase_interval_ms if phase_interval_ms is not None else interval_ms
+                )
                 for phase_sequence, current_payload in transmission_schedule(
-                    phase_payloads, interval_ms / 1000.0, active_duration
+                    phase_payloads, selected_interval_ms / 1000.0, active_duration
                 ):
                     attempted_count += 1
                     attempt_ns = time.time_ns()
@@ -936,7 +1011,13 @@ def run(args: argparse.Namespace) -> int:
             if campaign_enabled:
                 passive_phase("baseline", baseline_duration)
                 transmit_phase("normal", [normal_payload], normal_duration, False)
-                transmit_phase("mutation", payloads, mutation_duration, True)
+                transmit_phase(
+                    "mutation",
+                    sequence_payloads or payloads,
+                    mutation_duration,
+                    True,
+                    sequence_interval_ms,
+                )
             else:
                 transmit_phase(
                     "mutation" if mutation_enabled else "inject",
@@ -988,7 +1069,7 @@ def run(args: argparse.Namespace) -> int:
                 handle,
                 {
                     "record_type": "tx_session_end",
-                    "schema_version": 2,
+                    "schema_version": 3,
                     **now_fields(),
                     "host": hostname(),
                     "bus": bus_name,

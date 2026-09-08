@@ -10,8 +10,10 @@ import hashlib
 import json
 import random
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Mapping, Optional
 
+from a5_0x366_mutator import A5BlinkmodiMutator, TargetedMutation
 from mutation_engine import Mutator
 from trial_models import MutationCase
 
@@ -117,10 +119,51 @@ class TrialStrategySelector:
         source_bus: str,
         can_id: int,
         random_seed: int,
+        mutation_profile: Optional[str] = None,
+        dbc_path: Optional[Path] = None,
+        undefined_max_bits: int = 2,
     ) -> tuple[MutationCase, StrategyDecision]:
         decision = self.decide(state, random_seed)
         mutation_id = int(state.get("next_mutation_id", 1))
         rng = self._rng(random_seed, state)
+
+        if mutation_profile is not None:
+            if can_id != 0x366:
+                raise ValueError("targeted mutation profiles are only valid for CAN ID 0x366")
+            if dbc_path is None:
+                raise ValueError("targeted mutation profiles require an Audi A5 DBC path")
+            targeted, exploited = self._targeted_candidate(
+                state=state,
+                decision=decision,
+                original_payload=original_payload,
+                dbc_path=dbc_path,
+                mutation_profile=mutation_profile,
+                undefined_max_bits=undefined_max_bits,
+                rng=rng,
+            )
+            if decision.mode == "EXPLOIT" and not exploited:
+                decision = StrategyDecision(
+                    "EXPLORE",
+                    "TARGETED_PROFILE_EXPLORATION",
+                    None,
+                    None,
+                    "No related targeted case; deterministic profile exploration fallback",
+                )
+            parameters = targeted.parameters()
+            parameters["mutation_profile"] = mutation_profile
+            return MutationCase(
+                mutation_id=mutation_id,
+                source_bus=source_bus.lower(),
+                can_id=can_id,
+                operator=targeted.mutation_family.upper(),
+                original_payload=original_payload,
+                mutated_payload=targeted.mutated_payload,
+                random_seed=random_seed,
+                parent_mutation_id=decision.parent_mutation_id,
+                generation_reason=decision.reason,
+                strategy_mode=decision.mode,
+                parameters=parameters,
+            ), decision
 
         parent = self._parent_mutation(state, decision.parent_mutation_id)
         candidate: Optional[bytes] = None
@@ -154,6 +197,70 @@ class TrialStrategySelector:
             strategy_mode=decision.mode,
             parameters=parameters,
         ), decision
+
+    def _targeted_candidate(
+        self,
+        *,
+        state: Mapping[str, Any],
+        decision: StrategyDecision,
+        original_payload: bytes,
+        dbc_path: Path,
+        mutation_profile: str,
+        undefined_max_bits: int,
+        rng: random.Random,
+    ) -> tuple[TargetedMutation, bool]:
+        generator = A5BlinkmodiMutator(dbc_path, original_payload)
+        candidates = generator.generate_profile(mutation_profile, undefined_max_bits)
+        parent = self._parent_mutation(state, decision.parent_mutation_id)
+
+        if decision.mode == "EXPLOIT" and parent is not None:
+            parent_params = parent.parameters
+            parent_family = str(parent_params.get("mutation_family", ""))
+            parent_signals = {
+                str(item.get("signal"))
+                for item in parent_params.get("signals_changed", [])
+                if item.get("signal")
+            }
+            parent_undefined = set(parent_params.get("undefined_bits_changed", []))
+
+            def relevance(item: TargetedMutation) -> int:
+                params = item.parameters()
+                item_signals = {
+                    str(change.get("signal"))
+                    for change in params.get("signals_changed", [])
+                    if change.get("signal")
+                }
+                item_undefined = set(params.get("undefined_bits_changed", []))
+                return (
+                    4 * int(item.mutation_family == parent_family)
+                    + 3 * len(parent_signals & item_signals)
+                    + 2 * len(parent_undefined & item_undefined)
+                )
+
+            alternatives = [
+                item for item in candidates
+                if item.mutated_payload != parent.mutated_payload
+            ] or candidates
+            best_score = max(relevance(item) for item in alternatives)
+            focused = [item for item in alternatives if relevance(item) == best_score]
+            if best_score > 0:
+                return rng.choice(focused), True
+
+        # Exploration prefers an as-yet unexecuted semantic case. The selection
+        # remains deterministic because rng is derived from seed + feedback state.
+        executed = {
+            (
+                str(item.get("parameters", {}).get("mutation_profile", "")),
+                str(item.get("parameters", {}).get("mutation_family", "")),
+                str(item.get("parameters", {}).get("case", "")),
+            )
+            for item in state.get("mutation_history", [])
+        }
+        fresh = [
+            item for item in candidates
+            if (mutation_profile, item.mutation_family, item.case) not in executed
+        ]
+        return rng.choice(fresh or candidates), False
 
     @staticmethod
     def _parent_mutation(

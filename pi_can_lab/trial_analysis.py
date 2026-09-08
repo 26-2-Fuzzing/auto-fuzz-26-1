@@ -164,9 +164,9 @@ def analyze_trial(
             "baseline": baseline, "mutation": observed,
         })
 
-        # The injected frame on its source bus is transport evidence, not a
-        # functional anomaly. Other IDs and buses remain eligible.
-        if bus == mutation.source_bus.lower() and can_id == mutation.can_id:
+        # The target ID on any bus is transport/routing evidence, not by itself
+        # a functional reaction. Interesting feedback is reserved for other IDs.
+        if can_id == mutation.can_id:
             continue
         base_count = baseline["message_count"]
         mutation_count = observed["message_count"]
@@ -239,10 +239,6 @@ def analyze_trial(
         )
         if matches:
             propagated.append({"bus": bus.upper(), "matches": matches})
-            add_anomaly(bus.lower(), mutation.can_id, "CROSS_BUS", min(1.0, 0.7 + matches / 100.0), {
-                "metric": "exact_mutated_payload_observed", "matches": matches,
-                "source_bus": mutation.source_bus.upper(),
-            })
 
     existing_cross = {(item["target_bus"], item["target_id"]) for item in anomalies if item["type"] == "CROSS_BUS"}
     for item in list(anomalies):

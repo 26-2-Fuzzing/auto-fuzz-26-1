@@ -246,6 +246,35 @@ class TrialAnalysisTests(unittest.TestCase):
         self.assertEqual(timing["evidence"]["baseline_stddev_ms"], 0.0)
         self.assertEqual(timing["evidence"]["mutation_stddev_ms"], 10.0)
 
+    def test_exact_target_routing_on_other_bus_is_evidence_not_anomaly(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "i_can.jsonl"
+            routed = mutation().mutated_payload.hex().upper()
+            lines = [
+                self.record(1_000_000_000 + index * 20_000_000, "i_can", 0x366, BASE.hex())
+                for index in range(10)
+            ]
+            lines.extend(
+                self.record(2_000_000_000 + index * 20_000_000, "i_can", 0x366, routed)
+                for index in range(10)
+            )
+            path.write_text("".join(lines), encoding="utf-8")
+            result = analyze_trial(
+                rx_paths={"i_can": path},
+                phase_times_ns={
+                    "baseline_start": 1_000_000_000,
+                    "baseline_end": 1_500_000_000,
+                    "mutation_start": 2_000_000_000,
+                    "mutation_end": 2_500_000_000,
+                },
+                mutation=mutation(),
+                thresholds={"new_message_minimum_frames": 3},
+            )
+        self.assertEqual(result["anomalies"], [])
+        self.assertEqual(result["summary"]["propagated_payloads"], [
+            {"bus": "I_CAN", "matches": 10}
+        ])
+
 
 class FakeManager:
     def __init__(self, bus: str):
