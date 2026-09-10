@@ -1,0 +1,20 @@
+# Copy this file to distributed_node.yaml on each laptop and change node.bus,
+# SSH destination, project path, Python path, and receiver_config for that node.
+node:
+  # B_CAN on Control PC, P_CAN on P laptop, I_CAN on I laptop.
+  bus: P_CAN
+  project_dir: /home/pi/auto-fuzz-26-1/pi_can_lab
+  python: /home/pi/auto-fuzz-26-1/pi_can_lab/.venv/bin/python
+  receiver_config: receiver_p_can.yaml
+  remote_root: /tmp/auto_fuzz_distributed
+  results_dir: distributed_results
+
+  ssh:
+    host: 172.20.10.13
+    user: myung
+    # Use the private key path visible to the Python process on this laptop.
+    key_filename: C:/Users/user/.ssh/id_ed25519
+    connect_timeout_seconds: 10
+    look_for_keys: true
+    allow_agent: true
+    allow_unknown_host_key: false

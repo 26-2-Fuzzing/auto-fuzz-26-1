@@ -1,0 +1,47 @@
+# B-CAN Control PC configuration.
+# Copy to distributed_runner.yaml on the B-CAN laptop.
+experiments_root: experiments
+dbc: ../A5.dbc
+sender_config: sender_trial.yaml
+
+target:
+  channel: can0
+  probe_live_payload: true
+  probe_samples: 3
+  probe_timeout_seconds: 6
+  reference_payload: "00 00 00 00 20 00 00 F0"
+
+trial:
+  baseline_seconds: 10
+  normal_seconds: 5
+  mutation_seconds: 5
+  post_seconds: 10
+  runner_timeout_seconds: 120
+
+distributed:
+  # Start both receiver-laptop commands first, then run B-CAN inject within
+  # this lead window. Increase it if manual file/terminal handling takes longer.
+  receiver_lead_seconds: 30
+  receiver_tail_seconds: 5
+
+time_sync:
+  warning_threshold_ms: 50
+
+anomaly_thresholds:
+  minimum_baseline_frames: 5
+  minimum_timing_intervals: 3
+  new_message_minimum_frames: 3
+  timing_relative_change: 0.25
+  timing_stddev_absolute_ms: 2.0
+  frequency_relative_change: 0.50
+  message_loss_ratio: 0.10
+  payload_novel_ratio: 0.20
+
+feedback:
+  interesting_score_threshold: 0.60
+  bit_operation_ratio: 0.75
+  max_operations: 1
+  no_anomaly:
+    exploration_probability: 0.80
+  interesting:
+    exploitation_probability: 0.70
