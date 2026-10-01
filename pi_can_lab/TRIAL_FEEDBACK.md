@@ -16,8 +16,8 @@ Control PC
 Trial N: 단일 mutation 반복 송신
   → 캡처 종료
   → SFTP로 모든 JSONL 회수
-  → baseline/mutation 통계
-  → anomaly + mutation mapping
+  → 이전 완료 Trial과 현재 baseline/normal/mutation 대조
+  → anomaly 후보 + 반복 검증 + mutation mapping
   → feedback.json + feedback_state.json
   → Trial N+1 selector
 ```
@@ -120,7 +120,8 @@ experiments/experiment_0042/
 
 - `total_trials`, `next_mutation_id`, 멱등 완료 처리를 위한 `completed_trial_ids`
 - 모든 `mutation_history`
-- 점수순 `interesting_mutations`와 anomaly type
+- 과거 완료 Trial의 Baseline/Normal에서 관측한 payload와 현재 Trial의 동일 길이 변조 전 대조 창
+- 재검증 전 `feedback_candidates`, 반복 확인된 `interesting_mutations`와 anomaly type
 - operator별 `executed`/`interesting` 통계
 - `last_feedback`
 
@@ -129,19 +130,30 @@ Mutation에는 원본/변경 payload, operator, byte/bit, DBC decode가 가능�
 `reproduction_of_mutation_id`로 동일 mutation 반복 회차를 묶을 수 있습니다. 자동 재현 정책은
 없지만 `--reproduce-mutation-id`로 명시적 반복 실행할 수 있습니다.
 
+`PAYLOAD_CHANGE`는 현재 Baseline에 없다는 사실만으로 피드백이 되지 않습니다. 이전 완료
+Trial의 Baseline/Normal 및 현재 Normal의 payload를 제외하고, Mutation과 같은 길이의
+변조 전 창들보다 신규 payload 비율이 높아야 합니다. 첫 검출은 `candidate`이며, 같은 원본·변조
+payload를 별도 완료 Trial에서 사용했을 때 같은 버스/ID의 신규 payload가 다시 나타나야
+`verified`가 됩니다. 여기서 verified는 **CAN 로그상의 반복 관측**만 의미하며 차량 기능 이상
+또는 인과관계의 확정은 아닙니다. 다른 anomaly 유형과 기존 schema 1의 높은 점수는 보고서에
+남지만 자동 exploitation의 근거로 승격되지 않습니다.
+
 ## 전략과 재현성
 
 - 첫 Trial: 기존 로컬 `mutation_engine.py`로 exploration
-- 직전 완료 Trial이 흥미롭지 않음: 기본 80% exploration, 20% revisit
-- 흥미로운 anomaly 발견: 기본 70% parent 주변 exploitation, 30% exploration
-- timing/frequency: 값 주변과 boundary 우선
-- payload/new/loss/cross-bus: 같은 byte의 다른 bit와 인접 값 우선
+- 반복 확인된 후보가 없음: exploration (기존 점수 1.0 또는 미검증 후보로는 집중 탐색하지 않음)
+- 반복 확인된 후보가 있음: 기본 70% 검증된 parent 주변 exploitation, 30% exploration
+- 현재 자동 검증 대상인 payload 변화: 검증된 parent의 변경 byte 주변 bit·인접 값 탐색
+- timing/frequency/new/loss/cross-bus: 관측 결과로만 기록하고 자동 exploitation에는 사용하지 않음
 
 모든 비율과 anomaly threshold는 `experiment_runner.yaml`에서 바꿉니다. 동일한
 `random_seed + feedback_state + config + baseline payload`는 동일 선택을 재현합니다. 실제
 baseline payload가 달라지면 안전하고 의미 있는 mutation을 위해 결과도 달라질 수 있습니다.
 주기가 완전히 일정한 baseline에서 새 jitter가 발생하는 경우에는
 `timing_stddev_absolute_ms` 절대 임계값을 사용합니다.
+기존 설정에 `no_anomaly.exploration_probability`가 남아 있어도 무시하며, 미검증 mutation을
+재방문하던 20% 분기는 현재 사용하지 않습니다. 기존 experiment의 schema 1
+`interesting_mutations`도 자동으로 검증된 것으로 간주하지 않습니다.
 
 분석 산출물 기록 후 상태는 `analyzed`를 거쳐 `completed`가 됩니다. 이 사이에 runner가
 중단되면 다음 실행이 Trial ID 기준으로 FeedbackState를 중복 없이 반영하고 완료 상태를

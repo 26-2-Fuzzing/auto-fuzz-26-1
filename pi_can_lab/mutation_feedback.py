@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -363,10 +364,58 @@ def create_trial_feedback(
     mutation: MutationCase,
     anomalies: Sequence[Mapping[str, Any]],
     interesting_threshold: float,
+    prior_state: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Map every completed-trial anomaly to its single tracked mutation."""
-    max_score = max((float(item.get("score", 0.0)) for item in anomalies), default=0.0)
-    interesting = max_score >= interesting_threshold
+    """Keep detection separate from repeat-verified feedback for exploitation."""
+    raw_max_score = max((float(item.get("score", 0.0)) for item in anomalies), default=0.0)
+    prior_candidates = (prior_state or {}).get("feedback_candidates", [])
+    candidates: list[dict[str, Any]] = []
+    verified: list[dict[str, Any]] = []
+    for anomaly in anomalies:
+        evidence = anomaly.get("evidence") or {}
+        if (
+            anomaly.get("type") != "PAYLOAD_CHANGE"
+            or not evidence.get("feedback_eligible")
+            or float(anomaly.get("score", 0.0)) < interesting_threshold
+        ):
+            continue
+        payloads = evidence.get("novel_payloads") or []
+        hashes = sorted({hashlib.sha256(bytes.fromhex(value)).hexdigest() for value in payloads})
+        if not hashes:
+            continue
+        candidate = {
+            "trial_id": int(trial_id),
+            "mutation_id": mutation.mutation_id,
+            "source_bus": mutation.source_bus.upper(),
+            "source_id": f"0x{mutation.can_id:X}",
+            "original_payload": mutation.original_payload.hex().upper(),
+            "mutated_payload": mutation.mutated_payload.hex().upper(),
+            "target_bus": str(anomaly["target_bus"]).upper(),
+            "target_id": f"0x{int(str(anomaly['target_id']), 0):X}",
+            "type": str(anomaly["type"]),
+            "payload_hashes": hashes,
+            "score": float(anomaly["score"]),
+        }
+        candidates.append(candidate)
+        for prior in prior_candidates:
+            if int(prior.get("trial_id", -1)) == trial_id:
+                continue
+            keys = (
+                "source_bus", "source_id", "original_payload", "mutated_payload",
+                "target_bus", "target_id", "type",
+            )
+            if all(prior.get(key) == candidate[key] for key in keys) and set(prior.get("payload_hashes", [])) & set(hashes):
+                verified.append({
+                    "current": candidate,
+                    "previous_trial_id": int(prior["trial_id"]),
+                    "previous_mutation_id": int(prior["mutation_id"]),
+                })
+                break
+    interesting = bool(verified)
+    verified_keys = {
+        (item["current"]["target_bus"], item["current"]["target_id"], item["current"]["type"])
+        for item in verified
+    }
     mappings = [
         {
             "trial_id": int(trial_id),
@@ -382,18 +431,18 @@ def create_trial_feedback(
         }
         for anomaly in anomalies
     ]
-    reasons = [
-        f"{item.get('target_bus')} {item.get('target_id')} {item.get('type')}"
-        for item in anomalies
-        if float(item.get("score", 0.0)) >= interesting_threshold
-    ]
+    reasons = [f"{bus} {can_id} {kind} reproduced" for bus, can_id, kind in sorted(verified_keys)]
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "trial_id": int(trial_id),
         "mutation_id": mutation.mutation_id,
         "interesting": interesting,
-        "anomaly_score": round(max_score, 6),
-        "anomaly_types": sorted({str(item.get("type")) for item in anomalies}),
+        "verification_status": "verified" if verified else ("candidate" if candidates else "none"),
+        "anomaly_score": round(max((item["current"]["score"] for item in verified), default=0.0), 6),
+        "raw_max_anomaly_score": round(raw_max_score, 6),
+        "anomaly_types": sorted({item["current"]["type"] for item in verified}),
+        "candidate_events": candidates,
+        "verified_events": verified,
         "reasons": reasons,
         "mutation_region": mutation_region(mutation),
         "parent_mutation_id": mutation.parent_mutation_id,

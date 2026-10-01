@@ -15,6 +15,83 @@ from trial_models import MutationCase
 FrameKey = tuple[str, int, bool]
 
 
+def _historical_payloads(
+    experiment_dir: Path | None, current_trial_id: int | None,
+) -> tuple[dict[FrameKey, set[str]], dict[FrameKey, set[str]], int]:
+    """Use only completed earlier trials; keep pre-injection and all-phase history distinct."""
+    controls: dict[FrameKey, set[str]] = defaultdict(set)
+    seen_anywhere: dict[FrameKey, set[str]] = defaultdict(set)
+    trials_used = 0
+    if experiment_dir is None or current_trial_id is None:
+        return controls, seen_anywhere, trials_used
+    for trial_dir in sorted(experiment_dir.glob("trial_*")):
+        suffix = trial_dir.name.removeprefix("trial_")
+        if not suffix.isdigit() or int(suffix) >= current_trial_id:
+            continue
+        metadata_path = trial_dir / "metadata.json"
+        if not metadata_path.is_file():
+            continue
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if metadata.get("status") != "completed":
+            continue
+        phases = metadata.get("phase_times_ns") or {}
+        if not {"baseline_start", "baseline_end"} <= phases.keys():
+            continue
+        paths = {
+            bus: trial_dir / name
+            for bus, name in (metadata.get("logs") or {}).items()
+            if isinstance(name, str)
+        }
+        if not paths or not all(path.is_file() for path in paths.values()):
+            continue
+        trials_used += 1
+        spans = [(int(phases["baseline_start"]), int(phases["baseline_end"]))]
+        if {"normal_start", "normal_end"} <= phases.keys():
+            spans.append((int(phases["normal_start"]), int(phases["normal_end"])))
+        for bus, path in paths.items():
+            for frame in _load_frames(path, bus):
+                key = (frame["bus"], frame["id"], frame["extended"])
+                payload = frame["payload"].hex().upper()
+                seen_anywhere[key].add(payload)
+                if any(start <= frame["time_ns"] < end for start, end in spans):
+                    controls[key].add(payload)
+    return controls, seen_anywhere, trials_used
+
+
+def _payload_control_ratios(
+    baseline_frames: Sequence[dict[str, Any]],
+    normal_frames: Sequence[dict[str, Any]],
+    historical_controls: set[str],
+    phase_times_ns: Mapping[str, int],
+) -> list[float]:
+    """Compare pre-mutation windows of the same length as the mutation window."""
+    width = int(phase_times_ns["mutation_end"]) - int(phase_times_ns["mutation_start"])
+    if width <= 0:
+        return []
+    baseline_payloads = {item["payload"].hex().upper() for item in baseline_frames}
+    ratios: list[float] = []
+    for phase, frames in (("baseline", baseline_frames), ("normal", normal_frames)):
+        start_key, end_key = f"{phase}_start", f"{phase}_end"
+        if start_key not in phase_times_ns or end_key not in phase_times_ns:
+            continue
+        start, end = int(phase_times_ns[start_key]), int(phase_times_ns[end_key])
+        for window_start in range(start, end - width + 1, width):
+            window_end = window_start + width
+            window = [item for item in frames if window_start <= item["time_ns"] < window_end]
+            if not window:
+                continue
+            if phase == "baseline":
+                reference = historical_controls | {
+                    item["payload"].hex().upper()
+                    for item in baseline_frames
+                    if not window_start <= item["time_ns"] < window_end
+                }
+            else:
+                reference = historical_controls | baseline_payloads
+            ratios.append(sum(item["payload"].hex().upper() not in reference for item in window) / len(window))
+    return ratios
+
+
 def validate_capture_log(path: Path, expected_experiment_id: int) -> dict[str, Any]:
     starts = ends = frames = 0
     mismatches = []
@@ -117,6 +194,8 @@ def analyze_trial(
     phase_times_ns: Mapping[str, int],
     mutation: MutationCase,
     thresholds: Mapping[str, Any],
+    experiment_dir: Path | None = None,
+    current_trial_id: int | None = None,
 ) -> dict[str, Any]:
     baseline_start = int(phase_times_ns["baseline_start"])
     baseline_end = int(phase_times_ns["baseline_end"])
@@ -133,19 +212,28 @@ def analyze_trial(
     min_baseline = int(thresholds.get("minimum_baseline_frames", 5))
     min_timing_intervals = int(thresholds.get("minimum_timing_intervals", 3))
     new_message_min = int(thresholds.get("new_message_minimum_frames", 3))
+    min_payload_frames = int(thresholds.get("minimum_payload_mutation_frames", 5))
+    min_control_windows = int(thresholds.get("minimum_payload_control_windows", 2))
+    historical_controls, historical_anywhere, history_trial_count = _historical_payloads(
+        experiment_dir, current_trial_id
+    )
 
     grouped: dict[FrameKey, dict[str, list[dict[str, Any]]]] = defaultdict(
-        lambda: {"baseline": [], "mutation": []}
+        lambda: {"baseline": [], "normal": [], "mutation": []}
     )
     for configured_bus, path in rx_paths.items():
         frames = _load_frames(path, configured_bus)
         for item in _phase(frames, baseline_start, baseline_end):
             grouped[(item["bus"], item["id"], item["extended"])]["baseline"].append(item)
+        if {"normal_start", "normal_end"} <= phase_times_ns.keys():
+            for item in _phase(frames, int(phase_times_ns["normal_start"]), int(phase_times_ns["normal_end"])):
+                grouped[(item["bus"], item["id"], item["extended"])]["normal"].append(item)
         for item in _phase(frames, mutation_start, mutation_end):
             grouped[(item["bus"], item["id"], item["extended"])]["mutation"].append(item)
 
     metrics: list[dict[str, Any]] = []
     anomalies: list[dict[str, Any]] = []
+    suppressed_payload_candidates: list[dict[str, Any]] = []
 
     def add_anomaly(bus: str, can_id: int, kind: str, score: float, evidence: Mapping[str, Any]) -> None:
         anomalies.append({
@@ -157,6 +245,7 @@ def analyze_trial(
         })
 
     for (bus, can_id, extended), windows in sorted(grouped.items()):
+        frame_key = (bus, can_id, extended)
         baseline = _metrics(windows["baseline"], baseline_duration)
         observed = _metrics(windows["mutation"], mutation_duration)
         metrics.append({
@@ -170,9 +259,12 @@ def analyze_trial(
             continue
         base_count = baseline["message_count"]
         mutation_count = observed["message_count"]
-        if base_count == 0 and mutation_count >= new_message_min:
+        previously_seen = bool(historical_anywhere.get(frame_key))
+        if base_count == 0 and not windows["normal"] and not previously_seen and mutation_count >= new_message_min:
             add_anomaly(bus, can_id, "NEW_MESSAGE", min(1.0, 0.6 + mutation_count / 50.0), {
                 "mutation_message_count": mutation_count,
+                "historical_control_trials": history_trial_count,
+                "feedback_eligible": False,
             })
         if base_count >= min_baseline:
             rate_ratio = observed["frequency_hz"] / baseline["frequency_hz"] if baseline["frequency_hz"] else 0.0
@@ -216,16 +308,46 @@ def analyze_trial(
                 })
         if base_count and mutation_count:
             baseline_payloads = set(baseline["payloads"])
-            novel_count = sum(
-                item["payload"].hex().upper() not in baseline_payloads
-                for item in windows["mutation"]
+            mutation_payloads = [item["payload"].hex().upper() for item in windows["mutation"]]
+            raw_novel_ratio = sum(value not in baseline_payloads for value in mutation_payloads) / mutation_count
+            normal_payloads = {item["payload"].hex().upper() for item in windows["normal"]}
+            history_payloads = historical_controls.get(frame_key, set())
+            reference = baseline_payloads | normal_payloads | history_payloads
+            genuinely_novel = [value for value in mutation_payloads if value not in reference]
+            novel_ratio = len(genuinely_novel) / mutation_count
+            control_ratios = _payload_control_ratios(
+                windows["baseline"], windows["normal"], history_payloads, phase_times_ns
             )
-            novel_ratio = novel_count / mutation_count
-            if novel_ratio >= payload_ratio_threshold:
-                add_anomaly(bus, can_id, "PAYLOAD_CHANGE", _score(novel_ratio, payload_ratio_threshold), {
+            control_max = max(control_ratios, default=0.0)
+            excess_ratio = novel_ratio - control_max
+            if excess_ratio >= payload_ratio_threshold:
+                eligible = (
+                    base_count >= min_baseline
+                    and mutation_count >= min_payload_frames
+                    and len(control_ratios) >= min_control_windows
+                )
+                add_anomaly(bus, can_id, "PAYLOAD_CHANGE", _score(excess_ratio, payload_ratio_threshold), {
                     "novel_frame_ratio": novel_ratio,
+                    "raw_baseline_novel_ratio": raw_novel_ratio,
+                    "control_max_novel_ratio": control_max,
+                    "excess_novel_ratio": excess_ratio,
+                    "matched_control_window_count": len(control_ratios),
+                    "historical_control_trials": history_trial_count,
+                    "previously_seen_anywhere_count": sum(
+                        value in historical_anywhere.get(frame_key, set()) for value in set(genuinely_novel)
+                    ),
+                    "novel_payloads": sorted(set(genuinely_novel)),
+                    "feedback_eligible": eligible,
                     "baseline_unique": baseline["payload_unique_count"],
                     "mutation_unique": observed["payload_unique_count"],
+                })
+            elif raw_novel_ratio >= payload_ratio_threshold:
+                reason = "historical_or_normal_payload" if novel_ratio < payload_ratio_threshold else "pre_mutation_control_variability"
+                suppressed_payload_candidates.append({
+                    "target_bus": bus.upper(), "target_id": f"0x{can_id:X}",
+                    "reason": reason, "raw_baseline_novel_ratio": raw_novel_ratio,
+                    "remaining_novel_ratio": novel_ratio, "control_max_novel_ratio": control_max,
+                    "excess_novel_ratio": excess_ratio,
                 })
 
     propagated = []
@@ -252,15 +374,18 @@ def analyze_trial(
 
     anomalies.sort(key=lambda item: (-item["score"], item["target_bus"], item["target_id"], item["type"]))
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "thresholds": dict(thresholds),
         "phase_times_ns": dict(phase_times_ns),
         "metrics": metrics,
         "anomalies": anomalies,
+        "suppressed_payload_candidates": suppressed_payload_candidates,
         "summary": {
             "anomaly_count": len(anomalies),
             "maximum_score": max((item["score"] for item in anomalies), default=0.0),
             "cross_bus": any(item["type"] == "CROSS_BUS" for item in anomalies),
             "propagated_payloads": propagated,
+            "suppressed_payload_candidate_count": len(suppressed_payload_candidates),
+            "historical_control_trials": history_trial_count,
         },
     }

@@ -194,7 +194,9 @@ experiments/experiment_0042/trial_0001/
 ## 다음 Trial
 
 Trial 1 분석이 성공한 뒤 Control PC에서 `prepare`를 다시 실행한다. 동일 experiment ID를
-사용하면 `feedback_state.json`의 완료된 Trial 1 결과가 Trial 2 mutation 선택에 반영된다.
+사용하면 `feedback_state.json`의 완료된 결과를 읽는다. 첫 이상 반응은 후보로만 기록하며,
+별도 완료 Trial에서 같은 원본·변조 payload와 대상 버스/ID의 신규 payload가 반복 확인된
+경우에만 다음 mutation의 집중 탐색에 사용한다. 검증 전에는 계속 탐색한다.
 
 ```bash
 python3 distributed_runner.py prepare \

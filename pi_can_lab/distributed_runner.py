@@ -589,6 +589,8 @@ def analyze_distributed_trial(
         phase_times_ns=phases,
         mutation=mutation,
         thresholds=config.get("anomaly_thresholds", {}),
+        experiment_dir=store.path,
+        current_trial_id=int(plan["trial_id"]),
     )
     anomalies_doc = {
         "schema_version": 1, "trial_id": int(plan["trial_id"]),
@@ -597,7 +599,8 @@ def analyze_distributed_trial(
     store.write_json(trial_dir / "anomalies.json", anomalies_doc)
     threshold = float(config.get("feedback", {}).get("interesting_score_threshold", 0.6))
     feedback = create_trial_feedback(
-        int(plan["trial_id"]), mutation, analysis["anomalies"], threshold
+        int(plan["trial_id"]), mutation, analysis["anomalies"], threshold,
+        prior_state=store.load_feedback_state(),
     )
     store.write_json(trial_dir / "feedback.json", feedback)
     clocks = {
@@ -635,7 +638,7 @@ def analyze_distributed_trial(
     store.write_json(trial_dir / "metadata.json", metadata)
     print(f"[COMPLETED] Experiment {plan['experiment_id']}, Trial {plan['trial_id']}")
     print(f"[ANOMALY]   count={analysis['summary']['anomaly_count']} max={analysis['summary']['maximum_score']:.2f}")
-    print(f"[FEEDBACK]  interesting={'YES' if feedback['interesting'] else 'NO'}")
+    print(f"[FEEDBACK]  {feedback['verification_status'].upper()}")
     print("[NEXT]      Run prepare again; this completed feedback will select the next mutation.")
     return feedback
 

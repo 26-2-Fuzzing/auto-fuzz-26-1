@@ -10,7 +10,7 @@ from typing import Any, Mapping
 from trial_models import MutationCase, utc_now
 
 
-FEEDBACK_SCHEMA_VERSION = 1
+FEEDBACK_SCHEMA_VERSION = 2
 
 
 def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
@@ -50,6 +50,7 @@ class ExperimentStore:
             "next_mutation_id": 1,
             "completed_trial_ids": [],
             "interesting_mutations": [],
+            "feedback_candidates": [],
             "mutation_history": [],
             "mutation_statistics": {},
             "last_feedback": None,
@@ -102,6 +103,7 @@ class ExperimentStore:
         feedback: Mapping[str, Any],
     ) -> dict[str, Any]:
         state = self.load_feedback_state()
+        state["schema_version"] = FEEDBACK_SCHEMA_VERSION
         trial_id = int(feedback["trial_id"])
         completed_trial_ids = {
             int(value) for value in state.get("completed_trial_ids", [])
@@ -123,11 +125,14 @@ class ExperimentStore:
         entry = dict(operator_stats.get(mutation.operator, {}))
         entry["executed"] = int(entry.get("executed", 0)) + 1
         entry["interesting"] = int(entry.get("interesting", 0)) + int(
-            bool(feedback.get("interesting"))
+            bool(feedback.get("interesting")) and feedback.get("verification_status") == "verified"
         )
         operator_stats[mutation.operator] = entry
         state["mutation_statistics"] = operator_stats
-        if feedback.get("interesting"):
+        candidates = list(state.get("feedback_candidates", []))
+        candidates.extend(dict(item) for item in feedback.get("candidate_events", []))
+        state["feedback_candidates"] = candidates
+        if feedback.get("interesting") and feedback.get("verification_status") == "verified":
             interesting = list(state.get("interesting_mutations", []))
             interesting.append({
                 "mutation_id": mutation.mutation_id,
@@ -135,6 +140,7 @@ class ExperimentStore:
                 "mutation": mutation.to_dict(),
                 "anomaly_types": list(feedback.get("anomaly_types", [])),
                 "trial_id": feedback.get("trial_id"),
+                "verification_status": "verified",
             })
             interesting.sort(key=lambda item: (-float(item["score"]), int(item["mutation_id"])))
             state["interesting_mutations"] = interesting

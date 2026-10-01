@@ -32,10 +32,6 @@ class StrategyDecision:
 
 class TrialStrategySelector:
     def __init__(self, config: Mapping[str, Any]):
-        self.no_anomaly_exploration = self._probability(
-            config.get("no_anomaly", {}).get("exploration_probability", 0.8),
-            "no_anomaly.exploration_probability",
-        )
         self.interesting_exploitation = self._probability(
             config.get("interesting", {}).get("exploitation_probability", 0.7),
             "interesting.exploitation_probability",
@@ -76,34 +72,26 @@ class TrialStrategySelector:
             return StrategyDecision("EXPLORE", "INITIAL", None, None, "No previous feedback")
 
         rng = self._rng(random_seed, state)
-        last = state.get("last_feedback") or {}
-        interesting = bool(last.get("interesting"))
-        if interesting and rng.random() < self.interesting_exploitation:
-            parent = self._best_parent(state)
+        parent = self._best_parent(state)
+        if parent is not None and rng.random() < self.interesting_exploitation:
             region = parent.get("mutation", {}).get("changed_byte_indexes", []) if parent else []
             return StrategyDecision(
                 "EXPLOIT", "ANOMALY_NEIGHBORHOOD",
                 int(parent["mutation_id"]) if parent else None,
                 int(region[0]) if region else None,
-                "Previous completed trial produced an interesting anomaly",
-            )
-        if not interesting and rng.random() >= self.no_anomaly_exploration:
-            history = state.get("mutation_history", [])
-            parent = history[-1] if history else None
-            region = parent.get("changed_byte_indexes", []) if parent else []
-            return StrategyDecision(
-                "EXPLOIT", "REVISIT", int(parent["mutation_id"]) if parent else None,
-                int(region[0]) if region else None,
-                "No anomaly; configured revisit branch selected",
+                "A separate completed trial reproduced this feedback candidate",
             )
         return StrategyDecision(
             "EXPLORE", "GENERAL_MUTATION", None, None,
-            "Expand exploration after completed-trial feedback",
+            "No repeat-verified feedback selected for exploitation",
         )
 
     @staticmethod
     def _best_parent(state: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
-        candidates = list(state.get("interesting_mutations", []))
+        candidates = [
+            item for item in state.get("interesting_mutations", [])
+            if item.get("verification_status") == "verified"
+        ]
         if not candidates:
             return None
         return max(

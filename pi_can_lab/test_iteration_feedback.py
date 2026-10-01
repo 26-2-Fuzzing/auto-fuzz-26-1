@@ -42,18 +42,28 @@ class FeedbackStateTests(unittest.TestCase):
             store = ExperimentStore(Path(directory), 42, {"target": "0x366"})
             state = store.load_feedback_state()
             self.assertEqual(state["total_trials"], 0)
-            feedback = create_trial_feedback(1, mutation(), [{
+            anomaly = {
                 "target_bus": "I_CAN", "target_id": "0x123",
-                "type": "TIMING", "score": 0.87,
-            }], 0.6)
-            updated = store.record_completed_trial(mutation(), feedback)
+                "type": "PAYLOAD_CHANGE", "score": 0.87,
+                "evidence": {"feedback_eligible": True, "novel_payloads": ["AA"]},
+            }
+            first = create_trial_feedback(1, mutation(), [anomaly], 0.6, state)
+            self.assertEqual(first["verification_status"], "candidate")
+            store.record_completed_trial(mutation(), first)
+            second_mutation = mutation(2)
+            second = create_trial_feedback(
+                2, second_mutation, [anomaly], 0.6, store.load_feedback_state()
+            )
+            self.assertEqual(second["verification_status"], "verified")
+            updated = store.record_completed_trial(second_mutation, second)
             reloaded = store.load_feedback_state()
         self.assertEqual(updated, reloaded)
-        self.assertEqual(reloaded["total_trials"], 1)
-        self.assertEqual(reloaded["next_mutation_id"], 2)
+        self.assertEqual(reloaded["total_trials"], 2)
+        self.assertEqual(reloaded["next_mutation_id"], 3)
         self.assertEqual(reloaded["mutation_statistics"]["BIT_FLIP"]["interesting"], 1)
-        self.assertEqual(reloaded["interesting_mutations"][0]["mutation_id"], 1)
-        self.assertEqual(reloaded["completed_trial_ids"], [1])
+        self.assertEqual(reloaded["interesting_mutations"][0]["mutation_id"], 2)
+        self.assertEqual(reloaded["completed_trial_ids"], [1, 2])
+        self.assertEqual(len(reloaded["feedback_candidates"]), 2)
 
     def test_analyzed_trial_reconciliation_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -80,9 +90,25 @@ class FeedbackStateTests(unittest.TestCase):
             {"target_bus": "B_CAN", "target_id": "0x456", "type": "TIMING", "score": 0.87},
             {"target_bus": "I_CAN", "target_id": "0x321", "type": "NEW_MESSAGE", "score": 0.72},
         ], 0.6)
-        self.assertTrue(feedback["interesting"])
+        self.assertFalse(feedback["interesting"])
+        self.assertEqual(feedback["verification_status"], "none")
         self.assertEqual(len(feedback["mutation_anomaly_mappings"]), 2)
         self.assertTrue(all(item["mutation_id"] == 84 for item in feedback["mutation_anomaly_mappings"]))
+
+    def test_repeat_requires_same_source_and_target_payload(self) -> None:
+        anomaly = {
+            "target_bus": "P_CAN", "target_id": "0x1F8", "type": "PAYLOAD_CHANGE",
+            "score": 1.0,
+            "evidence": {"feedback_eligible": True, "novel_payloads": ["01"]},
+        }
+        first = create_trial_feedback(1, mutation(), [anomaly], 0.6)
+        prior = {"feedback_candidates": first["candidate_events"]}
+        different_response = {
+            **anomaly, "evidence": {"feedback_eligible": True, "novel_payloads": ["02"]}
+        }
+        second = create_trial_feedback(2, mutation(2), [different_response], 0.6, prior)
+        self.assertFalse(second["interesting"])
+        self.assertEqual(second["verification_status"], "candidate")
 
 
 class StrategySelectionTests(unittest.TestCase):
@@ -146,6 +172,7 @@ class StrategySelectionTests(unittest.TestCase):
             "interesting_mutations": [{
                 "mutation_id": 84, "score": 0.87,
                 "mutation": previous, "anomaly_types": ["TIMING"], "trial_id": 10,
+                "verification_status": "verified",
             }],
             "last_feedback": {"interesting": True},
         }
@@ -160,6 +187,17 @@ class StrategySelectionTests(unittest.TestCase):
         self.assertEqual(first.parent_mutation_id, 84)
         self.assertEqual(first.mutated_payload, second.mutated_payload)
         self.assertIn(first.operator, {"BOUNDARY", "BIT_FLIP", "NEIGHBOR"})
+
+    def test_legacy_unverified_score_cannot_be_exploited(self) -> None:
+        previous = mutation(84).to_dict()
+        state = {
+            "total_trials": 1, "next_mutation_id": 85,
+            "mutation_history": [previous],
+            "interesting_mutations": [{"mutation_id": 84, "score": 1.0, "mutation": previous}],
+            "last_feedback": {"interesting": True, "anomaly_score": 1.0},
+        }
+        decision = self.selector().decide(state, 42)
+        self.assertEqual(decision.mode, "EXPLORE")
 
 
 class TrialAnalysisTests(unittest.TestCase):
@@ -201,7 +239,7 @@ class TrialAnalysisTests(unittest.TestCase):
         anomaly_types = {item["type"] for item in result["anomalies"]}
         self.assertIn("TIMING", anomaly_types)
         self.assertIn("NEW_MESSAGE", anomaly_types)
-        self.assertIn("PAYLOAD_CHANGE", anomaly_types)
+        self.assertNotIn("PAYLOAD_CHANGE", anomaly_types)
         self.assertIn("CROSS_BUS", anomaly_types)
         metric = next(item for item in result["metrics"] if item["can_id"] == "0x456")
         self.assertEqual(metric["baseline"]["message_count"], 10)
@@ -274,6 +312,129 @@ class TrialAnalysisTests(unittest.TestCase):
         self.assertEqual(result["summary"]["propagated_payloads"], [
             {"bus": "I_CAN", "matches": 10}
         ])
+
+    def test_payload_candidate_uses_equal_length_pre_mutation_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "p_can.jsonl"
+            lines = [
+                self.record(1_000_000_000 + index * 100_000_000, "p_can", 0x1F8, "00")
+                for index in range(100)
+            ]
+            lines += [
+                self.record(11_000_000_000 + index * 100_000_000, "p_can", 0x1F8, "00")
+                for index in range(50)
+            ]
+            lines += [
+                self.record(16_000_000_000 + index * 100_000_000, "p_can", 0x1F8,
+                            "01" if index >= 6 else "00")
+                for index in range(10)
+            ]
+            path.write_text("".join(lines), encoding="utf-8")
+            phases = {
+                "baseline_start": 1_000_000_000, "baseline_end": 11_000_000_000,
+                "normal_start": 11_000_000_000, "normal_end": 16_000_000_000,
+                "mutation_start": 16_000_000_000, "mutation_end": 17_000_000_000,
+            }
+            result = analyze_trial(
+                rx_paths={"p_can": path}, phase_times_ns=phases,
+                mutation=mutation(), thresholds={},
+            )
+            candidate = next(item for item in result["anomalies"] if item["type"] == "PAYLOAD_CHANGE")
+            self.assertEqual(candidate["target_id"], "0x1F8")
+            self.assertTrue(candidate["evidence"]["feedback_eligible"])
+            self.assertEqual(candidate["evidence"]["matched_control_window_count"], 15)
+            self.assertEqual(candidate["evidence"]["control_max_novel_ratio"], 0.0)
+
+            # The same value in a completed earlier trial's pre-mutation traffic
+            # makes it an already-observed state, not a novel reaction.
+            previous = Path(directory) / "trial_0001"
+            previous.mkdir()
+            (previous / "metadata.json").write_text(json.dumps({
+                "status": "completed", "phase_times_ns": phases,
+                "logs": {"p_can": "p_can.jsonl"},
+            }), encoding="utf-8")
+            (previous / "p_can.jsonl").write_text(
+                self.record(1_000_000_000, "p_can", 0x1F8, "01"), encoding="utf-8"
+            )
+            historical_result = analyze_trial(
+                rx_paths={"p_can": path}, phase_times_ns=phases,
+                mutation=mutation(), thresholds={},
+                experiment_dir=Path(directory), current_trial_id=2,
+            )
+            self.assertFalse(any(
+                item["type"] == "PAYLOAD_CHANGE" and item["target_id"] == "0x1F8"
+                for item in historical_result["anomalies"]
+            ))
+            self.assertEqual(historical_result["summary"]["historical_control_trials"], 1)
+            self.assertEqual(
+                historical_result["suppressed_payload_candidates"][0]["reason"],
+                "historical_or_normal_payload",
+            )
+
+            # A prior occurrence only during injection is not a natural-state
+            # control; it may instead be a reproducible response.
+            (previous / "p_can.jsonl").write_text(
+                self.record(16_500_000_000, "p_can", 0x1F8, "01"), encoding="utf-8"
+            )
+            prior_injection_result = analyze_trial(
+                rx_paths={"p_can": path}, phase_times_ns=phases,
+                mutation=mutation(), thresholds={},
+                experiment_dir=Path(directory), current_trial_id=2,
+            )
+            candidate = next(
+                item for item in prior_injection_result["anomalies"]
+                if item["type"] == "PAYLOAD_CHANGE"
+            )
+            self.assertEqual(candidate["evidence"]["previously_seen_anywhere_count"], 1)
+
+            (previous / "metadata.json").write_text(json.dumps({
+                "status": "failed", "phase_times_ns": phases,
+                "logs": {"p_can": "p_can.jsonl"},
+            }), encoding="utf-8")
+            failed_history_result = analyze_trial(
+                rx_paths={"p_can": path}, phase_times_ns=phases,
+                mutation=mutation(), thresholds={},
+                experiment_dir=Path(directory), current_trial_id=2,
+            )
+            self.assertEqual(failed_history_result["summary"]["historical_control_trials"], 0)
+
+            # An occurrence during this Trial's Normal phase has the same effect.
+            path.write_text("".join(lines) + self.record(
+                15_900_000_000, "p_can", 0x1F8, "01"
+            ), encoding="utf-8")
+            normal_result = analyze_trial(
+                rx_paths={"p_can": path}, phase_times_ns=phases,
+                mutation=mutation(), thresholds={},
+            )
+            self.assertFalse(any(item["type"] == "PAYLOAD_CHANGE" for item in normal_result["anomalies"]))
+
+    def test_previous_sparse_message_is_not_new_again(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            previous = root / "trial_0001"
+            previous.mkdir()
+            phases = {
+                "baseline_start": 1_000_000_000, "baseline_end": 11_000_000_000,
+                "mutation_start": 16_000_000_000, "mutation_end": 17_000_000_000,
+            }
+            (previous / "metadata.json").write_text(json.dumps({
+                "status": "completed", "phase_times_ns": phases,
+                "logs": {"p_can": "p_can.jsonl"},
+            }), encoding="utf-8")
+            (previous / "p_can.jsonl").write_text(
+                self.record(2_000_000_000, "p_can", 0x17332811, "AA"), encoding="utf-8"
+            )
+            current = root / "current.jsonl"
+            current.write_text("".join(
+                self.record(16_000_000_000 + index * 10_000_000, "p_can", 0x17332811, "AA")
+                for index in range(3)
+            ), encoding="utf-8")
+            result = analyze_trial(
+                rx_paths={"p_can": current}, phase_times_ns=phases,
+                mutation=mutation(), thresholds={},
+                experiment_dir=root, current_trial_id=2,
+            )
+            self.assertNotIn("NEW_MESSAGE", {item["type"] for item in result["anomalies"]})
 
 
 class FakeManager:

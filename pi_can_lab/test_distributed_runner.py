@@ -175,7 +175,10 @@ class DistributedAnalysisTests(unittest.TestCase):
             store = ExperimentStore(root / "experiments", 42, {})
             state = store.load_feedback_state()
             trial = store.path / "trial_0001"
-            self.assertTrue(feedback["interesting"])
+            # One short baseline window cannot validate a payload change; a
+            # high raw anomaly score alone must not drive the next mutation.
+            self.assertFalse(feedback["interesting"])
+            self.assertEqual(feedback["verification_status"], "none")
             self.assertEqual(state["total_trials"], 1)
             self.assertTrue((trial / "p_can.jsonl").is_file())
             self.assertTrue((trial / "i_can.jsonl").is_file())
@@ -187,7 +190,7 @@ class DistributedAnalysisTests(unittest.TestCase):
                 base_payload=BASE, output=root / "trial2.zip",
             )
             _, next_mutation = load_trial_package(second)
-            self.assertEqual(next_mutation.parent_mutation_id, 1)
+            self.assertIsNone(next_mutation.parent_mutation_id)
 
     def test_duplicate_or_missing_receiver_role_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

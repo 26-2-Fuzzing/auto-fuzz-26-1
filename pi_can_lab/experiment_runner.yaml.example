@@ -50,12 +50,12 @@ anomaly_thresholds:
   frequency_relative_change: 0.50
   message_loss_ratio: 0.10
   payload_novel_ratio: 0.20
+  minimum_payload_mutation_frames: 5
+  minimum_payload_control_windows: 2
 
 feedback:
   interesting_score_threshold: 0.60
   bit_operation_ratio: 0.75
   max_operations: 1
-  no_anomaly:
-    exploration_probability: 0.80
   interesting:
     exploitation_probability: 0.70

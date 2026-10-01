@@ -382,6 +382,8 @@ class ExperimentRunner:
                 phase_times_ns=phases,
                 mutation=mutation,
                 thresholds=self.config.get("anomaly_thresholds", {}),
+                experiment_dir=store.path,
+                current_trial_id=trial_id,
             )
             anomalies_doc = {
                 "schema_version": 1,
@@ -391,7 +393,9 @@ class ExperimentRunner:
             }
             store.write_json(trial_dir / "anomalies.json", anomalies_doc)
             threshold = float(self.config.get("feedback", {}).get("interesting_score_threshold", 0.6))
-            feedback = create_trial_feedback(trial_id, mutation, analysis["anomalies"], threshold)
+            feedback = create_trial_feedback(
+                trial_id, mutation, analysis["anomalies"], threshold, prior_state=state
+            )
             store.write_json(trial_dir / "feedback.json", feedback)
             metadata["status"] = "analyzed"
             store.write_json(trial_dir / "metadata.json", metadata)
@@ -438,7 +442,8 @@ class ExperimentRunner:
         print(f"  Count          : {summary['anomaly_count']}")
         print(f"  Max Score      : {summary['maximum_score']:.2f}")
         print(f"  Cross-Bus      : {'YES' if summary['cross_bus'] else 'NO'}")
-        print(f"  Interesting    : {'YES' if feedback['interesting'] else 'NO'}\n")
+        print(f"  Feedback       : {feedback.get('verification_status', 'legacy').upper()}")
+        print(f"  Verified Score : {feedback['anomaly_score']:.2f}\n")
         print("Next Strategy")
         print(f"  Mode           : {next_decision.mode}")
         print(f"  Focus Byte     : {next_decision.focus_byte if next_decision.focus_byte is not None else '-'}")
