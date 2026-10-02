@@ -13,7 +13,9 @@
 
 `experiment_runner.py`는 노트북의 로컬 터미널에서 한 번만 실행한다. 각 Pi에서 `./lab rx`나 `./lab tx`를 별도로 실행하지 않는다.
 
-한 Trial이 완전히 끝나고 세 로그가 회수·분석된 뒤에만 그 Feedback을 다음 Trial Mutation 생성에 사용한다. 실행 중인 Trial의 Mutation을 실시간으로 변경하지 않는다.
+한 Trial이 완전히 끝나고 세 로그가 회수·분석된 뒤에 관측 후보를 기록한다. 현재 stage 1에서는
+자동 Feedback 선택을 차단하고, 다음 Trial은 일반 exploration으로 진행한다. 실행 중인 Trial의
+Mutation은 변경하지 않는다.
 
 ## 2. 사전 준비
 
@@ -62,6 +64,11 @@ source .venv/bin/activate
 python3 -m pip install -r requirements.txt
 cp experiment_runner.yaml.example experiment_runner.yaml
 ```
+
+현재 예시는 30/10/1/20초 수집, 50 ms 송신, 자동 feedback 비활성화인 stage 1 설정이다.
+이 구간의 anomaly는 검증된 차량 반응이 아니다. no-op 대조 및 held-out 세션 검증 없이
+`experiment_0001`만으로 현장 false-positive rate를 주장하지 않는다. 자세한 절차는
+[`CALIBRATION.md`](CALIBRATION.md)를 참고한다.
 
 Windows의 WSL에서 실행한다면 이후 네트워크 확인과 Fuzzer 실행도 동일한 WSL 터미널에서 수행한다.
 
@@ -146,7 +153,8 @@ source .venv/bin/activate
 python3 experiment_runner.py \
   --target-id 0x366 \
   --source-bus B_CAN \
-  --trials 20 \
+  --paired-cycle \
+  --cycle-max-sets 10 \
   --random-seed 366
 ```
 
@@ -158,7 +166,8 @@ python3 experiment_runner.py \
 python3 experiment_runner.py \
   --target-id 0x366 \
   --source-bus B_CAN \
-  --trials 20 \
+  --paired-cycle \
+  --cycle-max-sets 10 \
   --random-seed 366 \
   --execute
 ```
@@ -167,38 +176,66 @@ python3 experiment_runner.py \
 
 - `--target-id 0x366`: Mutation 대상 CAN ID
 - `--source-bus B_CAN`: Injection을 수행할 Pi와 CAN Bus
-- `--trials 20`: 완료할 Trial 수
+- `--paired-cycle`: 0x366의 실제 변조 계열 8개를 정해진 순서로 순회한다. 동일한
+  송신 내용과 안전 제한을 통과하지 못한 후보는 건너뛰고 사유를 계획에 기록한다.
+- `--cycle-max-sets 10`: 이번 명령에서 최대 10세트만 실행한다. 다음 실행은 같은
+  `--experiment-id`와 설정으로 이어간다. 기본값도 10세트다.
+- `--paired-sets 10`: 순차 사이클 대신 mutation과 no-op을 한 번씩 포함한 세트 10개를
+  기존 선택기로 실행한다. 두 구간의
+  순서는 세트마다 교대하며, 각 구간은 별도의 baseline/normal/recovery를 수집한다.
+- `--trials N`: 대조 세트가 아닌 기존 단독 Trial을 N개 실행할 때 사용한다.
 - `--random-seed 366`: Mutation 선택 재현을 위한 seed
 - `--execute`: 실제 SSH 접속과 CAN 송신 허용
 
 ## 7. 자동 수행되는 동작
 
-Runner는 각 Trial마다 다음 과정을 자동으로 수행한다.
+권장 paired mode에서는 mutation을 먼저 고정하고, 한 세트에서 다음 과정을 수행한다.
 
 ```text
-P/B/I-CAN 수신 동시 시작
-→ 세 수신 프로세스 생존 확인
-→ B-CAN의 정상 0x366 payload 확보
-→ Baseline 관찰
-→ 정상 0x366 송신
-→ 단일 Mutation 반복 송신
-→ Post-Mutation 관찰
-→ 세 수신 종료
-→ SFTP 로그 회수
-→ Baseline vs Mutation 분석
-→ Anomaly 및 Feedback 저장
-→ 다음 Trial Mutation 선택
+정상 0x366 원본 확보 및 이번 세트의 mutation 고정
+→ 첫 구간: P/B/I 수신, baseline, normal 송신, mutation 또는 no-op, recovery
+→ 로그 회수 및 첫 recovery 상태 복귀 확인
+→ 복귀가 확인되지 않으면 둘째 구간 송신 중단
+→ 원본 payload 재확인 후 둘째 구간 전체를 새로 캡처
+→ 두 구간의 사전 상태·TX 패턴·RX/시계 품질·이상 후보를 짝 비교
+→ 비교 가능하면 feedback·exploit 없이 다음 세트로 진행
+→ 비교 보류면 사유를 저장하고 캠페인 중단
 ```
 
-Trial 1은 기존 Mutation Engine으로 시작한다. Trial 2부터 완료된 이전 Trial의 `feedback_state.json`을 읽어 Exploration 또는 Exploitation 전략을 선택한다.
+한 구간은 예시 설정에서 61초이므로 세트당 송신·캡처만 최소 122초다. 회복과
+원본 일치가 확인되지 않으면 다음 구간을 보내지 않는다. 한 세트에서 mutation 쪽에만
+이상 후보가 나와도 검증 완료가 아니다. 별도 상태 일치 반복과 물리적 반응 확인이
+필요하며, 자동 exploitation은 비활성화돼 있다.
+
+순차 사이클은 **한 세트에 변조 후보 하나**만 적용한 뒤 다음 후보로 넘어간다.
+계열 순서는 `signal_single → signal_combination → state_contradiction →
+undefined_enum → undefined_bit_single → undefined_bit_multi →
+defined_undefined_mix → temporal_sequence`다. `all-0x366`은 이 계열들의
+합집합이므로 별도 다섯 번째 단계로 반복하지 않는다. 기본 DBC·기준 payload·1초
+변조 설정에서는 원시 후보 361개 중 281개를 실행 계획에 넣고 80개는 중복 송신
+또는 시간·안전 제한으로 제외한다. `undefined_enum`은 앞선 계열과 송신 내용이
+전부 같아 실행 0개로 기록된다. 실제 live 원본 payload나 설정이 다르면 수가
+달라진다. 전체 281세트는 캡처·송신 구간만 최소 9시간 31분 22초이므로 한 번에
+무제한 실행하지 말고 상태와 품질을 확인하면서 나누어 진행한다. 이 순회는 후보
+탐색이며 anomaly의 재현성 검증은 별도의 반복 실험으로 수행한다.
 
 ## 8. 기존 Experiment 재개와 Mutation 재현
 
-기존 Experiment 42를 이어서 실행한다.
+순차 사이클이 10세트 상한에서 멈춘 경우, 출력된 Experiment ID(예: 42)를
+사용해 다음 묶음을 이어서 실행한다. 완료된 세트는 다시 송신하지 않는다.
 
 ```bash
 python3 experiment_runner.py \
-  --experiment-id 42 \
+  --experiment-id 42 --target-id 0x366 --source-bus B_CAN \
+  --paired-cycle --cycle-max-sets 10 --random-seed 366 --execute
+```
+
+별도로 생성한 단독 Trial Experiment 43을 이어서 실행하려면 다음처럼 한다. 사이클과
+단독 Trial은 한 Experiment ID에 섞을 수 없다.
+
+```bash
+python3 experiment_runner.py \
+  --experiment-id 43 \
   --target-id 0x366 \
   --source-bus B_CAN \
   --trials 5 \
@@ -210,7 +247,7 @@ python3 experiment_runner.py \
 
 ```bash
 python3 experiment_runner.py \
-  --experiment-id 42 \
+  --experiment-id 43 \
   --target-id 0x366 \
   --source-bus B_CAN \
   --trials 4 \
@@ -229,6 +266,10 @@ Control PC에 결과가 다음 구조로 저장된다.
 experiments/experiment_0042/
 ├── experiment.json
 ├── feedback_state.json
+├── pairs/
+│   ├── cycle.json
+│   ├── pair_0001.json
+│   └── pair_0001_report.json
 └── trial_0001/
     ├── metadata.json
     ├── mutation.json
@@ -238,11 +279,11 @@ experiments/experiment_0042/
     ├── i_can.jsonl
     ├── anomalies.json
     ├── feedback.json
-    ├── sender.stdout.log
-    └── sender.stderr.log
+    └── sender.stdout.log
 ```
 
-원격 Pi에도 `/tmp/auto_fuzz_trials` 아래 raw log가 남는다. Control PC와 Pi의 raw log는 Runner가 자동 삭제하지 않는다. 네트워크나 캡처 실패로 완료되지 않은 Trial은 `failed`로 남고 다음 Mutation의 FeedbackState에는 반영되지 않는다.
+원격 Pi에도 `/tmp/auto_fuzz_trials` 아래 raw log가 남는다. Control PC와 Pi의 raw log는 Runner가 자동 삭제하지 않는다. 완료되지 않은 Trial은 FeedbackState에 반영되지 않는다.
+연결이 갑자기 끊기면 metadata가 `running`에 남을 수 있으므로 TX 완료 마커와 수신 로그를 확인한다.
 
 ## 10. 주의사항
 

@@ -1,5 +1,10 @@
 # Trial-based Feedback Pipeline 안정성 수정
 
+이 문서는 이전 안정성 수정의 기록입니다. 현재 stage 1에서는 자동 feedback 선택과
+exploitation을 차단했고, 판정기·no-op 대조·측정 시간을 다시 설계했습니다. 현행 동작은
+[`TRIAL_FEEDBACK.md`](TRIAL_FEEDBACK.md)와 [`CALIBRATION.md`](CALIBRATION.md)를
+기준으로 확인하십시오.
+
 ## 배경
 
 Trial 기반 feedback pipeline은 다음 순서로 동작합니다.

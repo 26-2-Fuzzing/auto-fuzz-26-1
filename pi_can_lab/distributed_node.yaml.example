@@ -1,5 +1,6 @@
 # Copy this file to distributed_node.yaml on each laptop and change node.bus,
 # SSH destination, project path, Python path, and receiver_config for that node.
+# Phase timing and feedback controls live in distributed_runner.yaml, not here.
 node:
   # B_CAN on Control PC, P_CAN on P laptop, I_CAN on I laptop.
   bus: P_CAN
@@ -8,6 +9,10 @@ node:
   receiver_config: receiver_p_can.yaml
   remote_root: /tmp/auto_fuzz_distributed
   results_dir: distributed_results
+  # Set the same nonempty clock_reference_id on all three laptops only when
+  # their clock offsets were measured against one verified shared reference.
+  # Leaving this unset makes cross-host timing attribution inconclusive.
+  # clock_reference_id: synchronized-lab-reference
 
   ssh:
     host: 172.20.10.13

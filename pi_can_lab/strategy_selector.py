@@ -32,8 +32,16 @@ class StrategyDecision:
 
 class TrialStrategySelector:
     def __init__(self, config: Mapping[str, Any]):
+        self.feedback_enabled = config.get("enabled", False)
+        if not isinstance(self.feedback_enabled, bool):
+            raise ValueError("feedback.enabled must be a boolean")
+        if self.feedback_enabled:
+            raise ValueError(
+                "Automatic feedback is disabled during calibration; "
+                "legacy verified labels cannot establish independent control validation"
+            )
         self.interesting_exploitation = self._probability(
-            config.get("interesting", {}).get("exploitation_probability", 0.7),
+            config.get("interesting", {}).get("exploitation_probability", 0.0),
             "interesting.exploitation_probability",
         )
         self.bit_operation_ratio = self._probability(
@@ -55,7 +63,7 @@ class TrialStrategySelector:
                 return {
                     str(key): semantic(item)
                     for key, item in value.items()
-                    if key not in {"updated_at", "created_at"}
+                    if key not in {"updated_at", "created_at", "control_trial_ids", "total_control_trials"}
                 }
             if isinstance(value, list):
                 return [semantic(item) for item in value]
@@ -71,19 +79,9 @@ class TrialStrategySelector:
         if int(state.get("total_trials", 0)) == 0:
             return StrategyDecision("EXPLORE", "INITIAL", None, None, "No previous feedback")
 
-        rng = self._rng(random_seed, state)
-        parent = self._best_parent(state)
-        if parent is not None and rng.random() < self.interesting_exploitation:
-            region = parent.get("mutation", {}).get("changed_byte_indexes", []) if parent else []
-            return StrategyDecision(
-                "EXPLOIT", "ANOMALY_NEIGHBORHOOD",
-                int(parent["mutation_id"]) if parent else None,
-                int(region[0]) if region else None,
-                "A separate completed trial reproduced this feedback candidate",
-            )
         return StrategyDecision(
             "EXPLORE", "GENERAL_MUTATION", None, None,
-            "No repeat-verified feedback selected for exploitation",
+            "Automatic feedback is disabled during detector calibration",
         )
 
     @staticmethod
@@ -91,6 +89,8 @@ class TrialStrategySelector:
         candidates = [
             item for item in state.get("interesting_mutations", [])
             if item.get("verification_status") == "verified"
+            and item.get("trial_kind", "mutation") != "noop"
+            and not item.get("calibration_only", False)
         ]
         if not candidates:
             return None

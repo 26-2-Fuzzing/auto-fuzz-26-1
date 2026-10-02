@@ -30,11 +30,14 @@ target:
   reference_payload: "00 00 00 00 20 00 00 F0"
 
 trial:
+  # Stage 1: bounded collection, not a claim of anomaly validity.
   capture_start_delay_seconds: 1.0
-  baseline_seconds: 10.0
-  normal_seconds: 5.0
-  mutation_seconds: 5.0
-  post_seconds: 10.0
+  baseline_seconds: 30.0
+  normal_seconds: 10.0
+  mutation_seconds: 1.0
+  post_seconds: 20.0
+  interval_ms: 50.0
+  watchdog_poll_seconds: 0.5
   runner_timeout_seconds: 120.0
 
 time_sync:
@@ -42,20 +45,21 @@ time_sync:
   warning_threshold_ms: 50.0
 
 anomaly_thresholds:
-  minimum_baseline_frames: 5
+  comparison_window_seconds: 1.0
+  minimum_comparison_frames: 5
   minimum_timing_intervals: 3
   new_message_minimum_frames: 3
+  minimum_persistence_frames: 3
   timing_relative_change: 0.25
   timing_stddev_absolute_ms: 2.0
   frequency_relative_change: 0.50
   message_loss_ratio: 0.10
-  payload_novel_ratio: 0.20
-  minimum_payload_mutation_frames: 5
-  minimum_payload_control_windows: 2
 
 feedback:
+  # Keep automatic feedback-guided mutation/exploitation off during calibration.
+  enabled: false
   interesting_score_threshold: 0.60
   bit_operation_ratio: 0.75
   max_operations: 1
   interesting:
-    exploitation_probability: 0.70
+    exploitation_probability: 0.0

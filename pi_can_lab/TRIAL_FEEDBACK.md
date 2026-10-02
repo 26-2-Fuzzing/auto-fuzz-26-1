@@ -1,8 +1,10 @@
 # Iteration-based Feedback 실험 운영
 
-이 파이프라인은 현재 Trial의 partial log를 사용하지 않습니다. 항상 Trial N의 송신과 세 버스
-캡처가 완전히 종료되고 SFTP 다운로드와 분석이 끝난 뒤 `feedback_state.json`을 갱신합니다.
-Trial N+1의 mutation selector만 그 갱신된 상태를 읽습니다.
+현재 stage 1 기본 설정은 `feedback.enabled: false`입니다. 자동 feedback-guided mutation과
+exploitation은 비활성화하고 anomaly 판정의 오탐을 먼저 교정합니다. 각 Trial의 송신과 세 버스
+캡처가 완전히 끝난 뒤에만 분석 결과를 기록합니다. `candidate`는 관측된 단일 Trial 변화이지
+검증된 반응이나 다음 mutation의 parent가 아닙니다. 오프라인 검증 절차는
+[`CALIBRATION.md`](CALIBRATION.md)를 참고하십시오.
 
 ## 구조
 
@@ -17,10 +19,19 @@ Trial N: 단일 mutation 반복 송신
   → 캡처 종료
   → SFTP로 모든 JSONL 회수
   → 이전 완료 Trial과 현재 baseline/normal/mutation 대조
-  → anomaly 후보 + 반복 검증 + mutation mapping
+  → anomaly 후보/보류 분류 + mutation mapping (인과 검증 아님)
   → feedback.json + feedback_state.json
-  → Trial N+1 selector
+  → Trial N+1은 feedback 비활성화 상태에서 일반 exploration
 ```
+
+권장 실행 단위는 **mutation/no-op 짝 세트**입니다. 같은 원본 payload와 미리 고정한
+mutation을 사용해 각각 `baseline → normal → mutation 또는 no-op → recovery` 전체를
+새로 캡처합니다. 두 구간의 순서는 세트마다 교대하여 순서 효과를 줄입니다. 첫 구간의
+recovery가 송신 전 상태로 돌아왔다는 증거가 부족하면 둘째 구간 송신을 중단합니다.
+두 구간이 모두 완료되어도 짝 비교는 `diagnostic / unverified`이며 자동 exploit이나 다음
+mutation 선택에 사용되지 않습니다. 두 구간을 비교한 결과가 `inconclusive`이면
+그 이유를 저장하고 같은 experiment의 후속 세트도 중단합니다. 장비 상태와 수집 품질을
+별도로 확인한 뒤에만 새 실험을 시작하십시오.
 
 ## 최초 설정
 
@@ -59,7 +70,7 @@ chrony 결과만 metadata에 기록합니다.
 python3 experiment_runner.py --target-id 0x366 --source-bus B_CAN --trials 20
 ```
 
-격리된 벤치에서 확인 후 실제 실행합니다.
+격리된 벤치에서 확인 후 단독 Trial을 실행하는 기존 방식은 다음과 같습니다.
 
 ```bash
 python3 experiment_runner.py \
@@ -71,6 +82,37 @@ python3 experiment_runner.py \
   --random-seed 366 \
   --execute
 ```
+
+현재 권장하는 순차 탐색은 `--paired-cycle`입니다. 한 변조 후보에 mutation/no-op
+짝 세트 하나를 적용하고, 8개 실제 계열을 순서대로 소진합니다. `--paired-sets 10`은
+기존 선택기로 독립 짝 세트 10개를 실행하는 별도 방식이며, `--trials`는 단독 Trial용입니다.
+먼저 `--execute` 없이 preview한 다음 실제 실행합니다.
+
+```bash
+python3 experiment_runner.py \
+  --target-id 0x366 --source-bus B_CAN \
+  --paired-cycle --cycle-max-sets 10 \
+  --undefined-max-bits 2 --random-seed 366 --execute
+```
+
+기본 상한은 명령 한 번당 10세트입니다. 멈춘 지점부터 이어가려면 같은 설정과
+`--experiment-id`를 지정해 다시 실행합니다. 이 상한에서 중단된 경우 Experiment는
+완료로 표시하지 않습니다. 기존 Trial이나 일반 짝 세트와 같은 Experiment ID를
+혼합하지 않습니다. 후보는 실제 송신 프레임열을 기준으로 중복 제거하고 50 ms/20프레임·
+완전한 temporal 패턴 조건을 만족하지 않으면 스킵 사유를 남깁니다. 기본
+`A5.dbc`·기준 payload에서는 원시 361개 중 281개가 실행 계획에 포함됩니다.
+`undefined_enum` 53개는 앞선 `signal_single`과 송신 내용이 모두 같아 별도
+송신하지 않습니다. `all-0x366`은 계열의 합집합이지 추가 단계가 아닙니다.
+
+각 구간의 예시 수집 시간은 30+10+1+20=61초이므로 한 세트는 송신·캡처 구간만
+최소 122초이며, 장비 시작/정지·회복 확인·원본 재측정 시간이 추가됩니다. 시간만
+늘려 표본을 확보하는 대신 상태가 맞는 독립 세트를 반복하고, 부족한 저빈도 ID는
+판정 보류합니다. 실제 장비에서 안전한 원본 송신 및 회복이 확인된 격리 벤치에서만
+`--execute`를 사용하십시오.
+
+이 순차 탐색은 서로 다른 후보를 한 번씩 관찰하는 단계입니다. 후보가 나와도
+검증된 anomaly로 간주하지 않으며, 이후 같은 후보의 상태 일치 독립 세트를
+반복하고 no-op 오탐률과 물리적 반응을 따로 확인해야 합니다.
 
 `--mutation-profile`을 생략하면 기존 generic mutation engine을 그대로 사용합니다. 전용 profile은
 `signal-aware`, `undefined-only`, `semantic-plus-undefined`, `temporal`, `all-0x366`이며 상세
@@ -105,8 +147,11 @@ experiments/experiment_0042/
 │   ├── anomalies.json
 │   ├── feedback.json
 │   ├── sender.stdout.log
-│   └── sender.stderr.log
-└── trial_0002/
+│   └── ...
+├── trial_0002/
+└── pairs/
+    ├── pair_0001.json         # 고정된 세트 계획·진행 상태
+    └── pair_0001_report.json  # 완료 후 대조 보고서
 ```
 
 `experiments/`와 실제 SSH 설정은 `.gitignore` 대상입니다. GitHub는 소스 배포에만 사용하고
@@ -119,9 +164,10 @@ experiments/experiment_0042/
 `feedback_state.json`은 완료된 Trial만 반영하며 다음 정보를 누적합니다.
 
 - `total_trials`, `next_mutation_id`, 멱등 완료 처리를 위한 `completed_trial_ids`
+- no-op만 집계하는 `total_control_trials`, `control_trial_ids`
 - 모든 `mutation_history`
 - 과거 완료 Trial의 Baseline/Normal에서 관측한 payload와 현재 Trial의 동일 길이 변조 전 대조 창
-- 재검증 전 `feedback_candidates`, 반복 확인된 `interesting_mutations`와 anomaly type
+- 재검증 전 `feedback_candidates`; 구 schema의 `interesting_mutations`는 선택에 사용하지 않음
 - operator별 `executed`/`interesting` 통계
 - `last_feedback`
 
@@ -130,23 +176,28 @@ Mutation에는 원본/변경 payload, operator, byte/bit, DBC decode가 가능�
 `reproduction_of_mutation_id`로 동일 mutation 반복 회차를 묶을 수 있습니다. 자동 재현 정책은
 없지만 `--reproduce-mutation-id`로 명시적 반복 실행할 수 있습니다.
 
-`PAYLOAD_CHANGE`는 현재 Baseline에 없다는 사실만으로 피드백이 되지 않습니다. 이전 완료
-Trial의 Baseline/Normal 및 현재 Normal의 payload를 제외하고, Mutation과 같은 길이의
-변조 전 창들보다 신규 payload 비율이 높아야 합니다. 첫 검출은 `candidate`이며, 같은 원본·변조
-payload를 별도 완료 Trial에서 사용했을 때 같은 버스/ID의 신규 payload가 다시 나타나야
-`verified`가 됩니다. 여기서 verified는 **CAN 로그상의 반복 관측**만 의미하며 차량 기능 이상
-또는 인과관계의 확정은 아닙니다. 다른 anomaly 유형과 기존 schema 1의 높은 점수는 보고서에
-남지만 자동 exploitation의 근거로 승격되지 않습니다.
+`PAYLOAD_CHANGE`는 새로운 전체 payload라는 이유만으로 확정하지 않습니다. 같은 길이의
+직전 normal 창, DBC 신호/동적 필드, 과거 완료 Trial, recovery 지속성 및 시계 정렬의 불확실성을
+함께 기록합니다. `feedback.json`은 candidate와 no-op control 관측을 분리하지만 현재 자동
+`verified` 승격은 하지 않고 `feedback_eligible`도 `false`입니다. 서로 다른 Trial에서 같은
+payload가 반복되더라도 차량 반응의 인과 검증이 아닙니다. 기존 schema의 높은 점수나
+`interesting_mutations`도 자동 exploitation 근거로 사용하지 않습니다.
 
 ## 전략과 재현성
 
-- 첫 Trial: 기존 로컬 `mutation_engine.py`로 exploration
-- 반복 확인된 후보가 없음: exploration (기존 점수 1.0 또는 미검증 후보로는 집중 탐색하지 않음)
-- 반복 확인된 후보가 있음: 기본 70% 검증된 parent 주변 exploitation, 30% exploration
-- 현재 자동 검증 대상인 payload 변화: 검증된 parent의 변경 byte 주변 bit·인접 값 탐색
-- timing/frequency/new/loss/cross-bus: 관측 결과로만 기록하고 자동 exploitation에는 사용하지 않음
+- `feedback.enabled: false`: 매 Trial 일반 exploration; 후보 점수와 기존 feedback state를
+  parent로 사용하지 않음
+- no-op control: mutation slot에서도 원본 payload를 같은 50 ms 간격으로 송신하고 별도
+  control 결과로 기록; `tx.jsonl`의 실제 송신 건수·payload·rate를 검증해야 비교 가능
+- paired set: mutation을 첫 구간 전에 한 번만 선택하고 원본·변조 payload를 고정한다.
+  둘째 구간 직전 live 원본이 달라지거나 회복/캡처/시간 정렬/송신 패턴 증거가 부족하면
+  짝 비교를 보류한다. temporal mutation이면 no-op도 동일한 mutation 구간 간격으로
+  원본을 송신한다. 미완료 세트를 자동 재전송·재사용하지 않는다.
+- 모든 anomaly 유형: 현재는 관측/보류 정보일 뿐 자동 exploitation에 사용하지 않음
 
-모든 비율과 anomaly threshold는 `experiment_runner.yaml`에서 바꿉니다. 동일한
+anomaly threshold와 송신 상한은 `experiment_runner.yaml`/`sender_trial.yaml`에서 확인합니다.
+현재 stage 1 예시는 baseline/normal/mutation/recovery 30/10/1/20초, 50 ms 간격이며
+1초 mutation 구간의 저빈도 ID는 검증 불가로 보류할 수 있습니다. 동일한
 `random_seed + feedback_state + config + baseline payload`는 동일 선택을 재현합니다. 실제
 baseline payload가 달라지면 안전하고 의미 있는 mutation을 위해 결과도 달라질 수 있습니다.
 주기가 완전히 일정한 baseline에서 새 jitter가 발생하는 경우에는
@@ -164,5 +215,7 @@ baseline payload가 달라지면 안전하고 의미 있는 mutation을 위해 �
 - 자동 reproduction policy는 아직 없고 schema/interface만 준비돼 있습니다.
 - 물리 램프·모터 반응은 CAN 로그만으로 판정하지 않습니다.
 - DBC signal metadata는 A5.dbc에서 원본과 mutation payload 모두 decode될 때만 기록됩니다.
-- clock offset은 경고와 기록만 하며 RX timestamp를 자동 보정하거나 시스템 시각을 변경하지 않습니다.
-- SSH 중단·네트워크 장애가 발생한 Trial은 `failed`로 남고 FeedbackState에는 반영되지 않습니다.
+- 분석기는 source host 대비 상대 clock offset을 적용하고 불확실성을 기록하지만 시스템 시각은 변경하지 않습니다.
+- 기존 `experiment_0001`은 no-op 검증 세션이나 현장 오탐률을 추정할 만큼 독립적인 음성 세션이 아닙니다.
+- 정상 완료가 확인되지 않은 Trial은 FeedbackState에 반영되지 않습니다. 연결이 끊겨 metadata가
+  `running`으로 남을 수 있으므로 TX 완료 마커와 수신 로그를 먼저 확인해야 합니다.

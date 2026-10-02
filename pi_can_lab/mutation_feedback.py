@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -365,23 +364,26 @@ def create_trial_feedback(
     anomalies: Sequence[Mapping[str, Any]],
     interesting_threshold: float,
     prior_state: Mapping[str, Any] | None = None,
+    *,
+    trial_kind: str | None = None,
 ) -> dict[str, Any]:
-    """Keep detection separate from repeat-verified feedback for exploitation."""
+    """Record observations without inferring causality from repeated payloads.
+
+    A single-trial detector (or two matching hashes) cannot certify an effect.
+    Controls are retained for false-alert evaluation, never as mutation parents.
+    ``prior_state`` stays in the API for old callers, but does not promote results.
+    """
+    kind = trial_kind or mutation.trial_kind
+    if kind not in {"mutation", "noop"} or kind != mutation.trial_kind:
+        raise ValueError("feedback trial kind must match the recorded trial")
     raw_max_score = max((float(item.get("score", 0.0)) for item in anomalies), default=0.0)
-    prior_candidates = (prior_state or {}).get("feedback_candidates", [])
     candidates: list[dict[str, Any]] = []
-    verified: list[dict[str, Any]] = []
     for anomaly in anomalies:
         evidence = anomaly.get("evidence") or {}
         if (
-            anomaly.get("type") != "PAYLOAD_CHANGE"
-            or not evidence.get("feedback_eligible")
+            anomaly.get("classification") != "candidate"
             or float(anomaly.get("score", 0.0)) < interesting_threshold
         ):
-            continue
-        payloads = evidence.get("novel_payloads") or []
-        hashes = sorted({hashlib.sha256(bytes.fromhex(value)).hexdigest() for value in payloads})
-        if not hashes:
             continue
         candidate = {
             "trial_id": int(trial_id),
@@ -393,29 +395,13 @@ def create_trial_feedback(
             "target_bus": str(anomaly["target_bus"]).upper(),
             "target_id": f"0x{int(str(anomaly['target_id']), 0):X}",
             "type": str(anomaly["type"]),
-            "payload_hashes": hashes,
             "score": float(anomaly["score"]),
+            "classification": "candidate",
+            "evidence": dict(evidence),
+            "trial_kind": kind,
+            "feedback_eligible": False,
         }
         candidates.append(candidate)
-        for prior in prior_candidates:
-            if int(prior.get("trial_id", -1)) == trial_id:
-                continue
-            keys = (
-                "source_bus", "source_id", "original_payload", "mutated_payload",
-                "target_bus", "target_id", "type",
-            )
-            if all(prior.get(key) == candidate[key] for key in keys) and set(prior.get("payload_hashes", [])) & set(hashes):
-                verified.append({
-                    "current": candidate,
-                    "previous_trial_id": int(prior["trial_id"]),
-                    "previous_mutation_id": int(prior["mutation_id"]),
-                })
-                break
-    interesting = bool(verified)
-    verified_keys = {
-        (item["current"]["target_bus"], item["current"]["target_id"], item["current"]["type"])
-        for item in verified
-    }
     mappings = [
         {
             "trial_id": int(trial_id),
@@ -431,19 +417,22 @@ def create_trial_feedback(
         }
         for anomaly in anomalies
     ]
-    reasons = [f"{bus} {can_id} {kind} reproduced" for bus, can_id, kind in sorted(verified_keys)]
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "trial_id": int(trial_id),
         "mutation_id": mutation.mutation_id,
-        "interesting": interesting,
-        "verification_status": "verified" if verified else ("candidate" if candidates else "none"),
-        "anomaly_score": round(max((item["current"]["score"] for item in verified), default=0.0), 6),
+        "trial_kind": kind,
+        "calibration_only": True,
+        "interesting": False,
+        "verification_status": "control" if kind == "noop" else ("candidate" if candidates else "none"),
+        "anomaly_score": 0.0,
         "raw_max_anomaly_score": round(raw_max_score, 6),
-        "anomaly_types": sorted({item["current"]["type"] for item in verified}),
-        "candidate_events": candidates,
-        "verified_events": verified,
-        "reasons": reasons,
+        "anomaly_types": [],
+        "observed_anomaly_types": sorted({item["type"] for item in candidates}),
+        "candidate_events": candidates if kind == "mutation" else [],
+        "control_events": candidates if kind == "noop" else [],
+        "verified_events": [],
+        "reasons": ["Observation only; independent control validation is required"] if candidates else [],
         "mutation_region": mutation_region(mutation),
         "parent_mutation_id": mutation.parent_mutation_id,
         "mutation_anomaly_mappings": mappings,

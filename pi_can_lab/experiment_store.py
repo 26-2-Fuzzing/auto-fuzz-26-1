@@ -10,7 +10,7 @@ from typing import Any, Mapping
 from trial_models import MutationCase, utc_now
 
 
-FEEDBACK_SCHEMA_VERSION = 2
+FEEDBACK_SCHEMA_VERSION = 3
 
 
 def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
@@ -47,6 +47,8 @@ class ExperimentStore:
             "schema_version": FEEDBACK_SCHEMA_VERSION,
             "experiment_id": self.experiment_id,
             "total_trials": 0,
+            "total_control_trials": 0,
+            "control_trial_ids": [],
             "next_mutation_id": 1,
             "completed_trial_ids": [],
             "interesting_mutations": [],
@@ -81,7 +83,9 @@ class ExperimentStore:
         for path in self.path.glob("trial_*/mutation.json"):
             try:
                 with path.open("r", encoding="utf-8") as handle:
-                    identifiers.append(int(json.load(handle)["mutation_id"]))
+                    document = json.load(handle)
+                    if document.get("trial_kind", "mutation") != "noop":
+                        identifiers.append(int(document["mutation_id"]))
             except (OSError, ValueError, KeyError, json.JSONDecodeError):
                 continue
         return max(identifiers, default=0) + 1
@@ -105,6 +109,19 @@ class ExperimentStore:
         state = self.load_feedback_state()
         state["schema_version"] = FEEDBACK_SCHEMA_VERSION
         trial_id = int(feedback["trial_id"])
+        kind = feedback.get("trial_kind", mutation.trial_kind)
+        if kind != mutation.trial_kind:
+            raise ValueError("Control/mutation metadata mismatch")
+        if kind == "noop":
+            controls = {int(value) for value in state.get("control_trial_ids", [])}
+            if trial_id not in controls:
+                controls.add(trial_id)
+                state["control_trial_ids"] = sorted(controls)
+                state["total_control_trials"] = len(controls)
+                # No-op results are diagnostic evidence, not mutation history,
+                # candidates, statistics or input to the next selector seed.
+                self.save_feedback_state(state)
+            return self.load_feedback_state()
         completed_trial_ids = {
             int(value) for value in state.get("completed_trial_ids", [])
         }
@@ -126,13 +143,15 @@ class ExperimentStore:
         entry["executed"] = int(entry.get("executed", 0)) + 1
         entry["interesting"] = int(entry.get("interesting", 0)) + int(
             bool(feedback.get("interesting")) and feedback.get("verification_status") == "verified"
+            and not feedback.get("calibration_only", False)
         )
         operator_stats[mutation.operator] = entry
         state["mutation_statistics"] = operator_stats
         candidates = list(state.get("feedback_candidates", []))
         candidates.extend(dict(item) for item in feedback.get("candidate_events", []))
         state["feedback_candidates"] = candidates
-        if feedback.get("interesting") and feedback.get("verification_status") == "verified":
+        if (feedback.get("interesting") and feedback.get("verification_status") == "verified"
+                and not feedback.get("calibration_only", False)):
             interesting = list(state.get("interesting_mutations", []))
             interesting.append({
                 "mutation_id": mutation.mutation_id,

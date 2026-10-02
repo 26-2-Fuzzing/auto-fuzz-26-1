@@ -8,11 +8,14 @@ import json
 import math
 import random
 import secrets
+import signal
 import sys
 import time
 import uuid
 from collections import Counter
+from decimal import Decimal, ROUND_CEILING
 from pathlib import Path
+from threading import current_thread, main_thread
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from can_common import (
@@ -74,6 +77,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--include-original", action="store_true", help="mutation 목록 첫 항목에 seed payload 포함")
     parser.add_argument("--random-seed", type=int, help="재현 가능한 mutation 난수 seed")
     parser.add_argument("--mutation-data", help="Trial runner가 선택한 단일 mutation payload")
+    parser.add_argument(
+        "--trial-contract-version", type=int, choices=(1,),
+        help="runner와 sender의 보수적 안전 계약 버전 (현재 1만 지원)",
+    )
+    parser.add_argument(
+        "--control-noop", action="store_true",
+        help="campaign 비교 구간에 원본 payload만 송신하는 명시적 대조 trial",
+    )
     parser.add_argument("--mutation-id", type=int, help="Trial mutation 고유 ID")
     parser.add_argument("--mutation-uid", help="사람이 추적할 MUT-000001 형식 ID")
     parser.add_argument("--parent-mutation-id", type=int, help="Feedback parent mutation ID")
@@ -174,6 +185,36 @@ def validate_finite(
         raise ConfigurationError(f"{field_name}은(는) {minimum:g} {comparator}이어야 합니다.")
 
 
+def optional_positive_limit(config: Dict[str, Any], name: str, *, integer: bool = False) -> Optional[float | int]:
+    """Absent campaign limits retain compatibility; configured limits fail closed."""
+    value = config.get(name)
+    if value is None:
+        return None
+    if integer:
+        if isinstance(value, bool) or not str(value).isdigit():
+            raise ConfigurationError(f"{name}은(는) 양의 정수여야 합니다.")
+        result = int(value)
+        if result < 1:
+            raise ConfigurationError(f"{name}은(는) 양의 정수여야 합니다.")
+        return result
+    result = float(value)
+    validate_finite(result, name, allow_equal=False)
+    return result
+
+
+def planned_frame_count(duration_seconds: float, interval_ms: float) -> int:
+    """Upper bound for periodic sends at t=0, interval, ... before the deadline."""
+    if interval_ms <= 0:
+        raise ConfigurationError("반복 송신 interval_ms는 0보다 커야 합니다.")
+    return int((
+        Decimal(str(duration_seconds)) * Decimal(1000) / Decimal(str(interval_ms))
+    ).to_integral_value(rounding=ROUND_CEILING))
+
+
+class SenderInterrupted(RuntimeError):
+    """Raised by the SIGTERM handler so the normal abort/restore path runs."""
+
+
 def mutation_summary(base_payload: bytes, payload: bytes) -> Dict[str, Any]:
     overlap = min(len(base_payload), len(payload))
     xor_bytes = bytes(
@@ -203,14 +244,20 @@ def transmission_schedule(
     duration_seconds: Optional[float] = None,
     clock: Callable[[], float] = time.monotonic,
     sleeper: Callable[[float], None] = time.sleep,
+    deadline_monotonic: Optional[float] = None,
 ) -> Iterator[Tuple[int, bytes]]:
     """Yield one payload pass, or cycle payloads until the duration expires."""
     if not payloads:
         return
 
-    deadline = clock() + duration_seconds if duration_seconds is not None else None
+    deadline = (
+        deadline_monotonic if deadline_monotonic is not None
+        else clock() + duration_seconds if duration_seconds is not None else None
+    )
     sequence = 0
-    while deadline is None or sequence == 0 or clock() < deadline:
+    # Floating-point clock increments can otherwise add an extra frame exactly
+    # at the nominal deadline (e.g. 0.1 + 4 * 0.05 versus 0.1 + 0.2).
+    while deadline is None or sequence == 0 or clock() + 1e-12 < deadline:
         if deadline is None and sequence >= len(payloads):
             break
 
@@ -375,6 +422,7 @@ def tx_record(
     tx_session_id: Optional[str] = None,
     experiment_id: Optional[str] = None,
     phase: Optional[str] = None,
+    trial_kind: Optional[str] = None,
 ) -> Dict[str, Any]:
     record = {
         "record_type": "can_tx",
@@ -386,6 +434,7 @@ def tx_record(
         "tx_session_id": tx_session_id,
         "experiment_id": experiment_id,
         "phase": phase,
+        "trial_kind": trial_kind,
         "kind": kind,
         "status": status,
         "sequence": sequence,
@@ -444,8 +493,27 @@ def run(args: argparse.Namespace) -> int:
     max_count = int(safety_cfg.get("max_count", 100))
     max_duration_seconds = float(safety_cfg.get("max_duration_seconds", 30.0))
     min_interval_ms = float(safety_cfg.get("min_interval_ms", 10.0))
+    contract_version = args.trial_contract_version
+    max_mutation_duration = optional_positive_limit(safety_cfg, "max_mutation_duration_seconds")
+    max_mutation_frames = optional_positive_limit(safety_cfg, "max_mutation_frames", integer=True)
+    max_normal_frames = optional_positive_limit(safety_cfg, "max_normal_frames", integer=True)
+    if contract_version == 1:
+        max_mutation_duration = min(max_mutation_duration, 1.0) if max_mutation_duration is not None else 1.0
+        max_mutation_frames = min(max_mutation_frames, 20) if max_mutation_frames is not None else 20
+        max_normal_frames = min(max_normal_frames, 200) if max_normal_frames is not None else 200
+        min_interval_ms = max(min_interval_ms, 50.0)
+    restore = bool(transmit_cfg.get("restore_original", True)) and not args.no_restore
+    configured_restore_count = int(transmit_cfg.get("restore_count", 1))
+    restore_count = max(1, configured_restore_count)
+    raw_restore_delay_ms = float(transmit_cfg.get("restore_delay_ms", interval_ms))
+    validate_finite(raw_restore_delay_ms, "restore_delay_ms")
+    restore_delay_ms = raw_restore_delay_ms
+    if contract_version == 1 and (not restore or configured_restore_count != 1):
+        raise ConfigurationError("trial contract 1 requires exactly one original restore frame")
     allow_protected = bool(args.allow_protected or safety_cfg.get("allow_protected_dbc_patch", False))
-    mutation_enabled = bool(args.mutate or mutation_cfg.get("enabled", False))
+    control_noop = bool(args.control_noop)
+    mutation_enabled = bool(args.mutate or mutation_cfg.get("enabled", False) or control_noop)
+    trial_kind = "noop" if control_noop else ("mutation" if mutation_enabled else "standard")
     explicit_mutation = parse_can_data(args.mutation_data) if args.mutation_data else None
     max_operations = int(choose(args.max_operations, mutation_cfg.get("max_operations"), 3))
     allow_dlc_change = bool(args.allow_dlc_change or mutation_cfg.get("allow_dlc_change", False))
@@ -481,6 +549,10 @@ def run(args: argparse.Namespace) -> int:
         resolve_path(feedback_value, None if args.feedback is not None else config_path)
         if feedback_value else None
     )
+    if feedback_path is not None and (contract_version == 1 or control_noop):
+        raise ConfigurationError(
+            "안전 계약/no-op 대조 trial에서는 sender-side feedback mutation을 사용할 수 없습니다."
+        )
     campaign_enabled = bool(campaign_cfg.get("enabled", False))
     baseline_duration = float(choose(
         args.baseline_duration, campaign_cfg.get("baseline_duration_seconds"), 10.0
@@ -510,6 +582,8 @@ def run(args: argparse.Namespace) -> int:
         raise ConfigurationError("--mutation-data Trial 모드에서는 --count 1이어야 합니다.")
     if explicit_mutation is not None and not mutation_enabled:
         raise ConfigurationError("--mutation-data를 사용하려면 mutation이 활성화되어야 합니다.")
+    if control_noop and not campaign_enabled:
+        raise ConfigurationError("--control-noop은 campaign에서만 사용할 수 있습니다.")
     validate_finite(interval_ms, "interval_ms")
     validate_finite(send_timeout, "send_timeout_seconds")
     validate_finite(max_duration_seconds, "max_duration_seconds", allow_equal=False)
@@ -548,10 +622,34 @@ def run(args: argparse.Namespace) -> int:
                 f"campaign 총 시간 {total_campaign_duration:g}초는 안전 제한 "
                 f"{max_campaign_duration:g}초를 초과합니다."
             )
-    if (count > 1 or duration_seconds is not None) and interval_ms < min_interval_ms:
+    if (campaign_enabled or count > 1 or duration_seconds is not None) and interval_ms < min_interval_ms:
         raise ConfigurationError(
             f"반복 송신 interval_ms는 안전 제한 {min_interval_ms:g}ms 이상이어야 합니다."
         )
+    if campaign_enabled:
+        if max_mutation_duration is not None and mutation_duration > max_mutation_duration:
+            raise ConfigurationError(
+                f"mutation_duration_seconds는 안전 제한 {max_mutation_duration:g}초 이하여야 합니다."
+            )
+        sequence_spec_for_limit = explicit_metadata.get("sequence")
+        mutation_interval_ms = interval_ms
+        if sequence_spec_for_limit is not None:
+            if not isinstance(sequence_spec_for_limit, dict):
+                raise ConfigurationError("temporal sequence metadata는 object여야 합니다.")
+            mutation_interval_ms = float(sequence_spec_for_limit.get("interval_ms", interval_ms))
+            validate_finite(mutation_interval_ms, "temporal sequence interval_ms", allow_equal=False)
+            if mutation_interval_ms < min_interval_ms:
+                raise ConfigurationError(
+                    f"temporal interval은 안전 제한 {min_interval_ms:g}ms 이상이어야 합니다."
+                )
+        if max_normal_frames is not None and planned_frame_count(normal_duration, interval_ms) > max_normal_frames:
+            raise ConfigurationError(
+                f"normal 송신 계획은 안전 제한 {max_normal_frames}프레임을 초과합니다."
+            )
+        if max_mutation_frames is not None and planned_frame_count(mutation_duration, mutation_interval_ms) > max_mutation_frames:
+            raise ConfigurationError(
+                f"mutation 송신 계획은 안전 제한 {max_mutation_frames}프레임을 초과합니다."
+            )
 
     configured_id = tx_cfg.get("id")
     frame_id = parse_int(args.frame_id if args.frame_id is not None else configured_id, "CAN ID") \
@@ -685,10 +783,6 @@ def run(args: argparse.Namespace) -> int:
     assert output_path is not None
     output_path = reserve_output_path(output_path, output_policy)
 
-    restore = bool(transmit_cfg.get("restore_original", True)) and not args.no_restore
-    restore_count = max(1, int(transmit_cfg.get("restore_count", 1)))
-    restore_delay_ms = max(0.0, float(transmit_cfg.get("restore_delay_ms", interval_ms)))
-    validate_finite(restore_delay_ms, "restore_delay_ms")
     execute = bool(args.execute)
 
     normal_payload = base_payload if base_payload is not None else payload
@@ -697,11 +791,37 @@ def run(args: argparse.Namespace) -> int:
     ))
     if mutation_seed_source not in {"patched", "normal"}:
         raise ConfigurationError("mutation.seed_source는 patched 또는 normal이어야 합니다.")
-    mutation_base = normal_payload if mutation_seed_source == "normal" else payload
+    mutation_base = normal_payload if control_noop or mutation_seed_source == "normal" else payload
     feedback_hints = []
     guided_entries = []
     mutation_metadata: Dict[bytes, Dict[str, Any]] = {}
-    if mutation_enabled:
+    if control_noop:
+        if count != 1:
+            raise ConfigurationError("--control-noop은 --count 1이어야 합니다.")
+        if explicit_mutation is not None and explicit_mutation != normal_payload:
+            raise ConfigurationError("--control-noop의 비교 payload는 원본과 같아야 합니다.")
+        sequence_spec = explicit_metadata.get("sequence")
+        sequence_payloads = None
+        sequence_interval_ms = None
+        if sequence_spec is not None:
+            if not isinstance(sequence_spec, dict):
+                raise ConfigurationError("no-op temporal sequence metadata는 object여야 합니다.")
+            raw_frames = sequence_spec.get("frames")
+            if not isinstance(raw_frames, list) or not raw_frames:
+                raise ConfigurationError("no-op temporal sequence frames가 비어 있습니다.")
+            sequence_payloads = [parse_can_data(str(value)) for value in raw_frames]
+            if any(frame != normal_payload for frame in sequence_payloads):
+                raise ConfigurationError(
+                    "no-op temporal sequence는 모든 프레임이 원본 payload여야 합니다."
+                )
+            sequence_interval_ms = float(sequence_spec.get("interval_ms", interval_ms))
+            validate_finite(sequence_interval_ms, "no-op temporal sequence interval_ms", allow_equal=False)
+            if sequence_interval_ms < min_interval_ms:
+                raise ConfigurationError(
+                    f"no-op temporal interval은 안전 제한 {min_interval_ms:g}ms 이상이어야 합니다."
+                )
+        payloads = [normal_payload]
+    elif mutation_enabled:
         if explicit_mutation is not None:
             if len(explicit_mutation) != len(mutation_base):
                 raise ConfigurationError(
@@ -803,7 +923,9 @@ def run(args: argparse.Namespace) -> int:
         sequence_interval_ms = None
 
     mode_name = "RAW" if raw_mode else "DBC PATCH"
-    if mutation_enabled:
+    if control_noop:
+        mode_name += " + NOOP CONTROL"
+    elif mutation_enabled:
         mode_name += " + LOCAL MUTATOR"
     print(f"[MODE]  {mode_name} / {'EXECUTE' if execute else 'PREVIEW'}")
     print(f"[BUS]   {interface_name}:{channel} ({bus_name})")
@@ -825,7 +947,7 @@ def run(args: argparse.Namespace) -> int:
             f"recovery={recovery_duration:g}s(passive)"
         )
         print(f"[NORMAL] 0x{frame_id:X}#{normal_payload.hex().upper()}")
-    if mutation_enabled:
+    if mutation_enabled and not control_noop:
         print(
             f"[MUT]   max_ops={max_operations}, structural={allow_dlc_change}, "
             f"include_seed={include_original}, random_seed={random_seed}"
@@ -868,6 +990,23 @@ def run(args: argparse.Namespace) -> int:
                     "channel": channel,
                     "tx_session_id": tx_session_id,
                     "experiment_id": experiment_id,
+                    "trial_kind": trial_kind,
+                    "trial_contract_version": contract_version,
+                    "effective_safety": {
+                        "min_interval_ms": min_interval_ms,
+                        "max_campaign_duration_seconds": (
+                            float(safety_cfg.get("max_campaign_duration_seconds", 240.0))
+                            if campaign_enabled else None
+                        ),
+                        "max_mutation_duration_seconds": max_mutation_duration,
+                        "max_mutation_frames": max_mutation_frames,
+                        "max_normal_frames": max_normal_frames,
+                    },
+                    "restore_policy": {
+                        "enabled": should_restore,
+                        "count": restore_count if should_restore else 0,
+                        "delay_ms": restore_delay_ms if should_restore else 0.0,
+                    },
                     "execute": execute,
                     "dbc": str(dbc_path) if dbc_path else None,
                     "protected_signals": protected,
@@ -886,7 +1025,8 @@ def run(args: argparse.Namespace) -> int:
                         "normal_data_hex": normal_payload.hex().upper() if campaign_enabled else None,
                     },
                     "mutation": {
-                        "enabled": mutation_enabled,
+                        "enabled": mutation_enabled and not control_noop,
+                        "control_noop": control_noop,
                         "base_data_hex": mutation_base.hex().upper(),
                         "seed_source": mutation_seed_source,
                         "max_operations": max_operations,
@@ -909,6 +1049,16 @@ def run(args: argparse.Namespace) -> int:
                 },
             )
             attempted_count = 0
+            phase_attempted: Dict[str, int] = {}
+            phase_sent: Dict[str, int] = {}
+            mutation_started = False
+            restore_result: Dict[str, Any] = {
+                "enabled": should_restore,
+                "attempted": 0,
+                "sent": 0,
+                "status": "pending" if should_restore else "disabled",
+                "error": None,
+            }
 
             def phase_marker(phase: str, event: str, duration: float) -> None:
                 write_jsonl(handle, {
@@ -918,6 +1068,7 @@ def run(args: argparse.Namespace) -> int:
                     "bus": bus_name,
                     "tx_session_id": tx_session_id,
                     "experiment_id": experiment_id,
+                    "trial_kind": trial_kind,
                     "phase": phase,
                     "event": event,
                     "duration_seconds": duration,
@@ -939,24 +1090,45 @@ def run(args: argparse.Namespace) -> int:
                 mutated: bool,
                 phase_interval_ms: Optional[float] = None,
             ) -> None:
-                nonlocal attempted_count
+                nonlocal attempted_count, mutation_started
                 marker_duration = phase_duration or 0.0
                 phase_marker(phase, "start", marker_duration)
+                if phase == "mutation":
+                    mutation_started = True
                 active_duration = phase_duration if execute else None
                 selected_interval_ms = (
                     phase_interval_ms if phase_interval_ms is not None else interval_ms
                 )
+                phase_deadline = (
+                    time.monotonic() + active_duration
+                    if active_duration is not None else None
+                )
+                phase_limit = (
+                    max_normal_frames if phase == "normal" else
+                    max_mutation_frames if phase == "mutation" and campaign_enabled else None
+                )
+                phase_attempted.setdefault(phase, 0)
+                phase_sent.setdefault(phase, 0)
                 for phase_sequence, current_payload in transmission_schedule(
-                    phase_payloads, selected_interval_ms / 1000.0, active_duration
+                    phase_payloads, selected_interval_ms / 1000.0,
+                    clock=time.monotonic, sleeper=time.sleep,
+                    deadline_monotonic=phase_deadline,
                 ):
+                    if phase_deadline is not None and time.monotonic() >= phase_deadline:
+                        raise RuntimeError(f"{phase} phase monotonic deadline exceeded before send")
+                    if phase_limit is not None and phase_attempted[phase] >= phase_limit:
+                        raise RuntimeError(f"{phase} phase frame limit {phase_limit} exceeded")
                     attempted_count += 1
+                    phase_attempted[phase] += 1
                     attempt_ns = time.time_ns()
                     kind = "normal" if phase == "normal" else "inject"
-                    if mutated:
+                    if phase == "mutation" and control_noop:
+                        kind = "control"
+                    elif mutated:
                         kind = "seed" if current_payload == mutation_base else "mutation"
                     details = (
                         mutation_summary(mutation_base, current_payload)
-                        if mutated else None
+                        if mutated and not control_noop else None
                     )
                     if details is not None:
                         details.update(mutation_metadata.get(current_payload, {}))
@@ -971,7 +1143,11 @@ def run(args: argparse.Namespace) -> int:
                         try:
                             bus.send(message, timeout=send_timeout)
                             status = "sent"
-                        except Exception as exc:
+                            phase_sent[phase] += 1
+                            send_over_deadline = (
+                                phase_deadline is not None and time.monotonic() > phase_deadline
+                            )
+                        except BaseException as exc:
                             failed = tx_record(
                                 bus_name, channel, frame_id, current_payload,
                                 is_extended, is_fd, "send_error", attempted_count,
@@ -980,6 +1156,7 @@ def run(args: argparse.Namespace) -> int:
                                 kind=kind, mutation=details,
                                 tx_session_id=tx_session_id,
                                 experiment_id=experiment_id, phase=phase,
+                                trial_kind=trial_kind,
                             )
                             failed["phase_sequence"] = phase_sequence
                             failed["send_attempt_wall_time_ns"] = attempt_ns
@@ -989,6 +1166,7 @@ def run(args: argparse.Namespace) -> int:
                             raise
                     else:
                         status = "preview"
+                        send_over_deadline = False
                     record = tx_record(
                         bus_name, channel, frame_id, current_payload,
                         is_extended, is_fd, status, attempted_count,
@@ -997,6 +1175,7 @@ def run(args: argparse.Namespace) -> int:
                         kind=kind, mutation=details,
                         tx_session_id=tx_session_id,
                         experiment_id=experiment_id, phase=phase,
+                        trial_kind=trial_kind,
                     )
                     record["phase_sequence"] = phase_sequence
                     record["send_attempt_wall_time_ns"] = attempt_ns
@@ -1006,68 +1185,73 @@ def run(args: argparse.Namespace) -> int:
                         f"[TX {phase}:{phase_sequence:06}] {status.upper()} "
                         f"0x{frame_id:X}#{current_payload.hex().upper()}"
                     )
+                    if send_over_deadline:
+                        raise RuntimeError(f"{phase} phase monotonic deadline exceeded during send")
                 phase_marker(phase, "end", marker_duration)
 
-            if campaign_enabled:
-                passive_phase("baseline", baseline_duration)
-                transmit_phase("normal", [normal_payload], normal_duration, False)
-                transmit_phase(
-                    "mutation",
-                    sequence_payloads or payloads,
-                    mutation_duration,
-                    True,
-                    sequence_interval_ms,
-                )
-            else:
-                transmit_phase(
-                    "mutation" if mutation_enabled else "inject",
-                    payloads,
-                    duration_seconds,
-                    mutation_enabled,
-                )
-
-            if should_restore:
-                if execute and restore_delay_ms:
+            def restore_original(*, aborting: bool = False) -> None:
+                if not should_restore:
+                    return
+                restore_result["status"] = "attempting"
+                if execute and restore_delay_ms and not aborting:
                     time.sleep(restore_delay_ms / 1000.0)
-                for sequence in range(1, restore_count + 1):
+                count_to_send = 1 if aborting else restore_count
+                for sequence in range(1, count_to_send + 1):
                     restore_attempt_ns = time.time_ns()
-                    if execute:
-                        assert bus is not None
-                        message = create_message(
-                            frame_id, restore_payload, is_extended, is_fd, bitrate_switch
+                    restore_result["attempted"] += 1
+                    try:
+                        if execute:
+                            assert bus is not None
+                            message = create_message(
+                                frame_id, restore_payload, is_extended, is_fd, bitrate_switch
+                            )
+                            bus.send(
+                                message,
+                                timeout=min(send_timeout, 1.0) if aborting else send_timeout,
+                            )
+                            status = "sent"
+                            restore_result["sent"] += 1
+                        else:
+                            status = "preview"
+                    except BaseException as exc:
+                        status = "send_error"
+                        restore_result["status"] = "failed"
+                        restore_result["error"] = f"{type(exc).__name__}: {exc}"
+                        failed_restore = tx_record(
+                            bus_name, channel, frame_id, restore_payload,
+                            is_extended, is_fd, status, sequence, message_name_arg,
+                            kind="restore", tx_session_id=tx_session_id,
+                            experiment_id=experiment_id,
+                            phase="recovery" if campaign_enabled else "restore",
+                            trial_kind=trial_kind,
                         )
-                        bus.send(message, timeout=send_timeout)
-                        status = "sent"
-                    else:
-                        status = "preview"
+                        failed_restore["send_attempt_wall_time_ns"] = restore_attempt_ns
+                        failed_restore["error"] = restore_result["error"]
+                        write_jsonl(handle, failed_restore)
+                        handle.flush()
+                        raise
                     restore_record = tx_record(
-                        bus_name,
-                        channel,
-                        frame_id,
-                        restore_payload,
-                        is_extended,
-                        is_fd,
-                        status,
-                        sequence,
-                        message_name_arg,
-                        kind="restore",
-                        tx_session_id=tx_session_id,
+                        bus_name, channel, frame_id, restore_payload,
+                        is_extended, is_fd, status, sequence, message_name_arg,
+                        kind="restore", tx_session_id=tx_session_id,
                         experiment_id=experiment_id,
                         phase="recovery" if campaign_enabled else "restore",
+                        trial_kind=trial_kind,
                     )
                     restore_record["send_attempt_wall_time_ns"] = restore_attempt_ns
                     write_jsonl(handle, restore_record)
+                    handle.flush()
                     print(
-                        f"[RESTORE {sequence:03}/{restore_count:03}] "
+                        f"[RESTORE {sequence:03}/{count_to_send:03}] "
                         f"{status.upper()} 0x{frame_id:X}#{restore_payload.hex().upper()}"
                     )
-                    if execute and sequence < restore_count:
+                    if execute and sequence < count_to_send:
                         time.sleep(interval_ms / 1000.0)
-            if campaign_enabled:
-                passive_phase("recovery", recovery_duration)
-            write_jsonl(
-                handle,
-                {
+                restore_result["status"] = "sent" if execute else "preview"
+                restore_result["error"] = None
+
+            def write_session_end(status: str, error: Optional[str] = None) -> None:
+                record = {
                     "record_type": "tx_session_end",
                     "schema_version": 3,
                     **now_fields(),
@@ -1075,18 +1259,85 @@ def run(args: argparse.Namespace) -> int:
                     "bus": bus_name,
                     "tx_session_id": tx_session_id,
                     "experiment_id": experiment_id,
-                    "status": "completed",
+                    "trial_kind": trial_kind,
+                    "trial_contract_version": contract_version,
+                    "status": status,
                     "execute": execute,
                     "planned": None if execute and (campaign_enabled or duration_seconds is not None) else attempted_count,
                     "payload_corpus_size": len(payloads),
                     "duration_seconds": duration_seconds,
                     "attempted": attempted_count,
-                },
-            )
-            handle.flush()
+                    "phase_attempted": dict(phase_attempted),
+                    "phase_sent": dict(phase_sent),
+                    "restore": dict(restore_result),
+                }
+                if error is not None:
+                    record["error"] = error
+                write_jsonl(handle, record)
+                handle.flush()
+
+            previous_sigterm = None
+            if current_thread() is main_thread():
+                previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+                def on_sigterm(signum: int, frame: Any) -> None:
+                    del signum, frame
+                    raise SenderInterrupted("sender received SIGTERM")
+
+                signal.signal(signal.SIGTERM, on_sigterm)
+            try:
+                if campaign_enabled:
+                    passive_phase("baseline", baseline_duration)
+                    transmit_phase("normal", [normal_payload], normal_duration, False)
+                    transmit_phase(
+                        "mutation",
+                        sequence_payloads or payloads,
+                        mutation_duration,
+                        True,
+                        sequence_interval_ms,
+                    )
+                else:
+                    transmit_phase(
+                        "mutation" if mutation_enabled else "inject",
+                        payloads,
+                        duration_seconds,
+                        mutation_enabled,
+                    )
+
+                restore_original()
+                if campaign_enabled:
+                    passive_phase("recovery", recovery_duration)
+                write_session_end("completed")
+            except BaseException as exc:
+                # A second SIGTERM must not interrupt the bounded, best-effort
+                # restore or replace the original failure in the manifest.
+                if previous_sigterm is not None:
+                    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                if mutation_started and should_restore and restore_result["sent"] == 0:
+                    try:
+                        restore_original(aborting=True)
+                    except BaseException as restore_exc:
+                        restore_result["status"] = "failed"
+                        restore_result["error"] = f"{type(restore_exc).__name__}: {restore_exc}"
+                elif not mutation_started and restore_result["status"] == "pending":
+                    restore_result["status"] = "not_needed"
+                try:
+                    write_session_end("aborted", f"{type(exc).__name__}: {exc}")
+                except Exception as log_exc:
+                    print(f"[WARN] failed to write abort manifest: {log_exc}", file=sys.stderr)
+                raise
+            finally:
+                if previous_sigterm is not None:
+                    signal.signal(signal.SIGTERM, previous_sigterm)
     finally:
         if bus is not None:
-            shutdown_bus(bus)
+            active_exception = sys.exc_info()[1]
+            try:
+                shutdown_bus(bus)
+            except Exception as shutdown_exc:
+                if active_exception is None:
+                    raise
+                print(f"[WARN] failed to close CAN bus: {shutdown_exc}", file=sys.stderr)
 
     print("[DONE] 송신 작업 완료")
     return 0
