@@ -422,6 +422,59 @@ class StateAwareAnalysisTests(unittest.TestCase):
         self.assertEqual(timing["evidence"]["mutation_count"], 5)
         self.assertAlmostEqual(timing["evidence"]["mutation_stddev_ms"], 10.0)
 
+    def test_multimodal_median_shift_needs_mean_rate_change(self) -> None:
+        phases = {
+            "baseline_start": 10 * NS, "baseline_end": 20 * NS,
+            "normal_start": 20 * NS, "normal_end": 22 * NS,
+            "mutation_start": 22 * NS, "mutation_end": 23 * NS,
+        }
+
+        def window(start_ns: int, gaps_ms: list[int]) -> list[str]:
+            stamp = start_ns + 5_000_000
+            stamps = [stamp]
+            for gap in gaps_ms:
+                stamp += gap * 1_000_000
+                stamps.append(stamp)
+            return [record("b_can", 0x3C1, "AA", value) for value in stamps]
+
+        multimodal_control = [30] * 4 + [60] * 2 + [90] + [100] * 2 + [110] * 3 + [115]
+        multimodal_mutation = [30] * 3 + [60] * 4 + [100] * 3 + [115] * 3
+        cases = (
+            ("phase_shift", multimodal_control, multimodal_mutation, False),
+            ("rate_shift", [50] * 13, [75] * 13, True),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "b_can.jsonl"
+            for name, control_gaps, mutation_gaps, should_be_candidate in cases:
+                with self.subTest(name=name):
+                    write_frames(path, (
+                        window(20 * NS, control_gaps)
+                        + window(21 * NS, control_gaps)
+                        + window(22 * NS, mutation_gaps)
+                    ))
+                    result = analyze_trial(
+                        rx_paths={"b_can": path}, phase_times_ns=phases,
+                        mutation=mutation(), thresholds={}, clock_offsets=CLOCKS,
+                    )
+                    candidates = [item for item in result["anomalies"]
+                                  if item["target_id"] == "0x3C1" and item["type"] == "TIMING"]
+                    self.assertEqual(bool(candidates), should_be_candidate)
+                    if should_be_candidate:
+                        self.assertGreaterEqual(
+                            candidates[0]["evidence"]["mean_relative_change"], 0.25
+                        )
+                    else:
+                        timing = next(item for item in result["observations"]
+                                      if item["target_id"] == "0x3C1"
+                                      and item["type"] == "TIMING")
+                        self.assertEqual(timing["classification"], "inconclusive")
+                        self.assertEqual(
+                            timing["evidence"]["reason"],
+                            "median_shift_without_mean_rate_change",
+                        )
+                        self.assertAlmostEqual(timing["evidence"]["control_mean_ms"], 75)
+                        self.assertAlmostEqual(timing["evidence"]["mutation_mean_ms"], 75)
+
 
 if __name__ == "__main__":
     unittest.main()

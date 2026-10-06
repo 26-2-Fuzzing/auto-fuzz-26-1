@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -117,6 +119,41 @@ class RemoteCapture:
                 "Capture exited before injection; refusing to transmit: "
                 + ", ".join(sorted(stopped))
             )
+
+    def wait_ready(self, experiment_id: int, timeout_seconds: float = 20.0) -> None:
+        """Wait for every receiver to open CAN and flush its session marker."""
+        if set(self.handles) != set(self.managers):
+            raise RuntimeError("Not all configured captures were started")
+        deadline = time.monotonic() + timeout_seconds
+        pending = set(self.handles)
+        while pending:
+            for bus in sorted(pending):
+                manager = self.managers[bus]
+                handle = self.handles[bus]
+                if not manager.process_alive(handle.process):
+                    raise RuntimeError(f"{bus} capture exited before becoming ready")
+                result = manager.run(
+                    ["head", "-n", "1", "--", handle.remote_jsonl],
+                    timeout=5.0, check=False,
+                )
+                if not result.stdout.strip():
+                    continue
+                try:
+                    marker = json.loads(result.stdout.splitlines()[0])
+                except json.JSONDecodeError:
+                    continue  # The first line may still be in the process of being written.
+                if (marker.get("record_type") != "session_start"
+                        or str(marker.get("experiment_id")) != str(experiment_id)
+                        or marker.get("bus") != bus):
+                    raise RuntimeError(f"{bus} capture has an unexpected session marker")
+                pending.remove(bus)
+            if pending:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        "Receivers did not become ready: " + ", ".join(sorted(pending))
+                    )
+                time.sleep(min(0.2, remaining))
 
     def download_all(self, trial_dir: Path) -> dict[str, Path]:
         paths: dict[str, Path] = {}

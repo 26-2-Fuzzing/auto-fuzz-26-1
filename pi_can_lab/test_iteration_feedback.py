@@ -6,10 +6,11 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from experiment_store import ExperimentStore
 from can_sender import build_parser as build_sender_parser, run as run_sender
-from experiment_runner import ExperimentRunner
+from experiment_runner import ExperimentRunner, PairedClockPreflightError
 from ssh_manager import CommandResult
 from mutation_feedback import create_trial_feedback
 from remote_capture import RemoteCapture
@@ -522,6 +523,31 @@ class FakeManager:
 
 
 class RemoteCaptureTests(unittest.TestCase):
+    def test_capture_waits_for_session_marker_before_ready(self) -> None:
+        class DelayedManager(FakeManager):
+            def __init__(self, bus):
+                super().__init__(bus)
+                self.probes = 0
+
+            def run(self, command, timeout=None, check=True):
+                self.probes += 1
+                if self.probes == 1:
+                    return CommandResult("", "not ready", 1)
+                marker = {"record_type": "session_start", "experiment_id": 42, "bus": self.bus}
+                return CommandResult(json.dumps(marker) + "\n", "", 0)
+
+        managers = {bus: DelayedManager(bus) for bus in ("p_can", "b_can", "i_can")}
+        capture = RemoteCapture(
+            managers,
+            {bus: "/project/pi_can_lab" for bus in managers},
+            {bus: "python3" for bus in managers},
+            {bus: f"receiver_{bus}.yaml" for bus in managers},
+            "/tmp/trials",
+        )
+        capture.start_all(42, 1)
+        capture.wait_ready(42, timeout_seconds=1)
+        self.assertTrue(all(manager.probes == 2 for manager in managers.values()))
+
     def test_three_pi_capture_is_mockable_and_collected(self) -> None:
         managers = {bus: FakeManager(bus) for bus in ("p_can", "b_can", "i_can")}
         capture = RemoteCapture(
@@ -622,6 +648,9 @@ class FakeRunnerManager(FakeManager):
         del timeout, check
         if "candump" in command:
             return CommandResult("(1.0) can0 366#00000000200000F0\n" * 3, "", 0)
+        if command[0] == "head":
+            marker = {"record_type": "session_start", "experiment_id": 42, "bus": self.bus}
+            return CommandResult(json.dumps(marker) + "\n", "", 0)
         return CommandResult("sender complete\n", "", 0)
 
     def clock_sample(self):
@@ -707,6 +736,21 @@ class FakeRunnerManager(FakeManager):
         pass
 
 
+class AdjustableClockManager(FakeRunnerManager):
+    def __init__(self, config):
+        super().__init__(config)
+        self.round_trip_ms = config.get("round_trip_ms", 0.2)
+        self.round_trip_sequence = config.get("round_trip_sequence")
+        self.clock_calls = 0
+
+    def clock_sample(self):
+        self.clock_calls += 1
+        sequence = self.round_trip_sequence
+        rtt = (sequence[min(self.clock_calls - 1, len(sequence) - 1)]
+               if sequence else self.round_trip_ms)
+        return {"offset_ms": 0.0, "round_trip_ms": rtt}
+
+
 class ExperimentRunnerIntegrationTests(unittest.TestCase):
     @staticmethod
     def config() -> dict:
@@ -760,6 +804,121 @@ class ExperimentRunnerIntegrationTests(unittest.TestCase):
         self.assertEqual(metadata["status"], "failed")
         self.assertIn("probe failed", metadata["error"])
         self.assertEqual(state["total_trials"], 0)
+
+    def test_paired_clock_sampling_retries_until_all_receivers_align(self) -> None:
+        config = self.config()
+        config["remote"]["hosts"]["b_can"]["round_trip_sequence"] = [120.0]
+        config["remote"]["hosts"]["p_can"]["round_trip_sequence"] = [160.0, 60.0]
+        config["remote"]["hosts"]["i_can"]["round_trip_sequence"] = [30.0]
+        runner = ExperimentRunner(config, manager_factory=AdjustableClockManager)
+        try:
+            standalone = runner.check_clocks()
+            self.assertEqual(standalone["p_can"]["round_trip_ms"], 160.0)
+            self.assertEqual(runner.managers["p_can"].clock_calls, 1)
+        finally:
+            runner.close()
+
+        runner = ExperimentRunner(config, manager_factory=AdjustableClockManager)
+        try:
+            paired = runner.check_clocks(paired_source_bus="b_can")
+            self.assertEqual(paired["p_can"]["round_trip_ms"], 60.0)
+            self.assertEqual(len(paired["p_can"]["samples"]), 2)
+            self.assertEqual(
+                {bus: manager.clock_calls for bus, manager in runner.managers.items()},
+                {"p_can": 2, "b_can": 2, "i_can": 2},
+            )
+        finally:
+            runner.close()
+
+    def test_paired_clock_failure_is_retryable_without_trial_or_transmission(self) -> None:
+        config = self.config()
+        for host in config["remote"]["hosts"].values():
+            host["round_trip_ms"] = 250.0
+        with tempfile.TemporaryDirectory() as directory:
+            store = ExperimentStore(Path(directory), 42, config)
+            runner = ExperimentRunner(config, manager_factory=AdjustableClockManager)
+            selector = TrialStrategySelector(config["feedback"])
+            try:
+                with self.assertRaisesRegex(PairedClockPreflightError, "before transmission"):
+                    runner.run_paired_set(
+                        store=store, source_bus="b_can", can_id=0x366,
+                        random_seed=366, selector=selector, dbc_path=None,
+                    )
+                pair_path = store.path / "pairs" / "pair_0001.json"
+                pair = json.loads(pair_path.read_text())
+                self.assertEqual(pair["status"], "prepared")
+                self.assertEqual(pair["last_clock_preflight_failure"]["trial_id"], 1)
+                self.assertFalse((store.path / "trial_0001").exists())
+                self.assertTrue(all(not manager.started for manager in runner.managers.values()))
+                self.assertTrue(all(manager.clock_calls == 4
+                                    for manager in runner.managers.values()))
+
+                for manager in runner.managers.values():
+                    manager.round_trip_ms = 0.2
+                with patch("experiment_runner.recovery_returned_to_prestate", return_value={
+                    "status": "stable", "reasons": [],
+                }), patch("experiment_runner.analyze_trial_pair", return_value={
+                    "comparability": {"status": "comparable"},
+                }):
+                    runner.run_paired_set(
+                        store=store, source_bus="b_can", can_id=0x366,
+                        random_seed=366, selector=selector, dbc_path=None,
+                    )
+                completed = json.loads(pair_path.read_text())
+                self.assertEqual(completed["status"], "completed")
+                self.assertEqual(completed["first_trial_id"], pair["first_trial_id"])
+                self.assertEqual(completed["frozen_mutation"], pair["frozen_mutation"])
+            finally:
+                runner.close()
+
+    def test_second_paired_clock_failure_preserves_completed_first_episode(self) -> None:
+        config = self.config()
+        for host in config["remote"]["hosts"].values():
+            host["round_trip_sequence"] = [0.2, 250.0, 250.0, 250.0, 250.0]
+        with tempfile.TemporaryDirectory() as directory:
+            store = ExperimentStore(Path(directory), 42, config)
+            runner = ExperimentRunner(config, manager_factory=AdjustableClockManager)
+            selector = TrialStrategySelector(config["feedback"])
+            try:
+                with patch("experiment_runner.recovery_returned_to_prestate", return_value={
+                    "status": "stable", "reasons": [],
+                }), patch("experiment_runner.analyze_trial_pair", return_value={
+                    "comparability": {"status": "comparable"},
+                }):
+                    with self.assertRaises(PairedClockPreflightError):
+                        runner.run_paired_set(
+                            store=store, source_bus="b_can", can_id=0x366,
+                            random_seed=366, selector=selector, dbc_path=None,
+                        )
+                    pair_path = store.path / "pairs" / "pair_0001.json"
+                    paused = json.loads(pair_path.read_text())
+                    first_record = (store.path / "trial_0001" / "metadata.json").read_bytes()
+                    self.assertEqual(paused["status"], "first_completed")
+                    self.assertFalse((store.path / "trial_0002").exists())
+                    sender_commands = [
+                        command for command in runner.managers["b_can"].started
+                        if "--trial-contract-version" in command
+                    ]
+                    self.assertEqual(len(sender_commands), 1)
+
+                    for manager in runner.managers.values():
+                        manager.round_trip_sequence = None
+                        manager.round_trip_ms = 0.2
+                    runner.run_paired_set(
+                        store=store, source_bus="b_can", can_id=0x366,
+                        random_seed=366, selector=selector, dbc_path=None,
+                    )
+                self.assertEqual(json.loads(pair_path.read_text())["status"], "completed")
+                self.assertEqual(
+                    (store.path / "trial_0001" / "metadata.json").read_bytes(), first_record
+                )
+                sender_commands = [
+                    command for command in runner.managers["b_can"].started
+                    if "--trial-contract-version" in command
+                ]
+                self.assertEqual(len(sender_commands), 2)
+            finally:
+                runner.close()
 
     def test_completed_trial_updates_state_only_after_collection_and_analysis(self) -> None:
         config = self.config()

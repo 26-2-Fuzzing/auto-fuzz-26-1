@@ -25,6 +25,44 @@ PHASES = ("baseline", "normal", "mutation", "recovery")
 STATE_WINDOW_NS = 5_000_000_000
 MAX_CLOCK_UNCERTAINTY_NS = 100_000_000
 MIN_STATE_FRAMES = 10
+# This high-resolution fuel-level estimate drifts by one 0.01 L raw step
+# during ordinary pre-exposure collection. Larger changes remain visible in
+# the recovery comparison.
+STATE_RAW_STEP_TOLERANCE = {"KBI_Tankinhalt_hochaufl": 1}
+# These limits cover small changes observed between the pre-exposure windows
+# of completed pairs. Keep them scoped to the DBC message and signal: another
+# signal in the same CAN message still has to match. They do not change an
+# episode's recovery gate or mutation candidate analysis.
+PAIR_RAW_STEP_TOLERANCE = {
+    (0x6B8, "KBI_Tankinhalt_hochaufl"): 2,  # 0.02 L, 0.01 L/raw
+    (0x3B5, "KL_Anf_KL"): 1,                 # 0.4 percentage points/raw
+    (0x6B0, "FS_Taupunkt"): 4,               # 0.4 °C, 0.1 °C/raw
+    (0x6B0, "FS_Luftfeuchte_rel"): 2,        # 1 percentage point, 0.5/raw
+    (0xA8, "MO_Mom_Begr_dyn"): 1,            # DBC has no physical unit
+    (0x154, "MO_Mom_Begr_Schalt"): 1,        # DBC has no physical unit
+}
+PAIR_SIGNAL_PHYSICAL_SCALE = {
+    (0x6B8, "KBI_Tankinhalt_hochaufl"): (0.01, "L"),
+    (0x3B5, "KL_Anf_KL"): (0.4, "percentage_points"),
+    (0x6B0, "FS_Taupunkt"): (0.1, "°C"),
+    (0x6B0, "FS_Luftfeuchte_rel"): (0.5, "percentage_points"),
+}
+FUEL_SIGNAL_KEY = (0x6B8, "KBI_Tankinhalt_hochaufl")
+# Both observed ~90 s pairs and an earlier ~8 min pause imply approximately
+# 1 L/hour of fuel use at idle. Allow 1.2 L/hour plus two raw steps for meter
+# quantization, but do not let an arbitrarily long pause hide >0.20 L.
+FUEL_PAIR_DRIFT_L_PER_HOUR = 1.2
+FUEL_PAIR_MAX_RAW_STEPS = 20
+
+
+def _paired_step_tolerances(elapsed_seconds: float) -> dict[tuple[int, str], int]:
+    tolerances = dict(PAIR_RAW_STEP_TOLERANCE)
+    scale, _ = PAIR_SIGNAL_PHYSICAL_SCALE[FUEL_SIGNAL_KEY]
+    modeled_steps = math.ceil(elapsed_seconds * FUEL_PAIR_DRIFT_L_PER_HOUR / 3600 / scale)
+    tolerances[FUEL_SIGNAL_KEY] = min(
+        FUEL_PAIR_MAX_RAW_STEPS, PAIR_RAW_STEP_TOLERANCE[FUEL_SIGNAL_KEY] + modeled_steps,
+    )
+    return tolerances
 
 
 def _json(path: Path) -> dict[str, Any]:
@@ -366,10 +404,190 @@ def _source_original_evidence(trial: Mapping[str, Any]) -> dict[str, Any]:
             "phase_counts": details, "reasons": reasons}
 
 
+def _pre_exposure_trends(
+    trial: Mapping[str, Any], layouts: Mapping[int, Any],
+) -> dict[tuple[str, int, str], dict[str, Any]]:
+    """Find slow signal motion observed before this episode's mutation phase.
+
+    Require sustained values at both ends and monotone one-step transitions.
+    A change seen only after exposure cannot qualify as background motion.
+    """
+    phases = trial["phases"]
+    start, end = phases["baseline_start"], phases["normal_end"]
+    target_id = trial["mutation"].can_id
+    trends: dict[tuple[str, int, str], dict[str, Any]] = {}
+    for bus, frames in trial["frames"].items():
+        by_id: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        for frame in frames:
+            if start <= frame["time_ns"] < end and frame["id"] != target_id:
+                by_id[frame["id"]].append(frame)
+        for can_id, group in by_id.items():
+            for signal in layouts.get(can_id, ()):
+                if signal.muxed or _AUTOMATIC_FIELD.search(signal.name) or _signal_is_contextual(signal.name):
+                    continue
+                samples = [(frame["time_ns"], value) for frame in group
+                           if (value := signal.decode(frame["payload"])) is not None]
+                values = [value for _, value in samples]
+                if len(values) < 2 * MIN_STATE_FRAMES or values[0] == values[-1]:
+                    continue
+                direction = 1 if values[-1] > values[0] else -1
+                transitions = [b - a for a, b in zip(values, values[1:]) if b != a]
+                if (not transitions or len(transitions) > 3
+                        or any(step != direction for step in transitions)):
+                    continue
+                first_count = next((index for index, value in enumerate(values)
+                                    if value != values[0]), len(values))
+                last_count = next((index for index, value in enumerate(reversed(values))
+                                   if value != values[-1]), len(values))
+                if min(first_count, last_count) < 5:
+                    continue
+                first_duration = samples[first_count - 1][0] - samples[0][0]
+                last_duration = samples[-1][0] - samples[-last_count][0]
+                if min(first_duration, last_duration) < 1_000_000_000:
+                    continue
+                trends[(bus, can_id, signal.name)] = {
+                    "from": values[0], "to": values[-1],
+                    "direction": "up" if direction > 0 else "down",
+                    "frame_count": len(values), "transitions": len(transitions),
+                }
+    return trends
+
+
+def _paired_background_trends(
+    mutation: Mapping[str, Any], noop: Mapping[str, Any], layouts: Mapping[int, Any],
+) -> dict[tuple[str, int, str], dict[str, Any]]:
+    """Exclude matching pre-exposure motion only at an observed, plausible rate."""
+    first = _pre_exposure_trends(mutation, layouts)
+    second = _pre_exposure_trends(noop, layouts)
+    m_start = mutation["phases"]["baseline_start"]
+    n_start = noop["phases"]["baseline_start"]
+    elapsed_s = abs(m_start - n_start) / 1e9
+    m_duration_s = (mutation["phases"]["normal_end"] - m_start) / 1e9
+    n_duration_s = (noop["phases"]["normal_end"] - n_start) / 1e9
+    if min(m_duration_s, n_duration_s) <= 0:
+        return {}
+    result: dict[tuple[str, int, str], dict[str, Any]] = {}
+    for key, motion in first.items():
+        control_motion = second.get(key)
+        if control_motion is None or motion["direction"] != control_motion["direction"]:
+            continue
+        earlier, later = ((motion, control_motion) if m_start <= n_start
+                          else (control_motion, motion))
+        direction = 1 if motion["direction"] == "up" else -1
+        if direction * (later["from"] - earlier["to"]) < 0:
+            continue
+        observed_shift = abs(motion["to"] - control_motion["to"])
+        max_rate = max(
+            motion["transitions"] / m_duration_s,
+            control_motion["transitions"] / n_duration_s,
+        )
+        max_shift = math.ceil(max_rate * elapsed_s) + 2
+        if observed_shift > max_shift:
+            continue
+        result[key] = {
+            "mutation": motion, "noop": control_motion,
+            "elapsed_seconds": round(elapsed_s, 3),
+            "observed_shift_raw": observed_shift,
+            "max_shift_raw": max_shift,
+        }
+    return result
+
+
+def _pre_exposure_envelopes(
+    trial: Mapping[str, Any], layouts: Mapping[int, Any],
+) -> dict[tuple[str, int, str], dict[str, Any]]:
+    """Find values repeatedly observed before mutation, ignoring rare outliers."""
+    phases = trial["phases"]
+    start, end = phases["baseline_start"], phases["normal_end"]
+    target_id = trial["mutation"].can_id
+    envelopes: dict[tuple[str, int, str], dict[str, Any]] = {}
+    for bus, frames in trial["frames"].items():
+        by_id: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        for frame in frames:
+            if start <= frame["time_ns"] < end and frame["id"] != target_id:
+                by_id[frame["id"]].append(frame)
+        for can_id, group in by_id.items():
+            for signal in layouts.get(can_id, ()):
+                if signal.muxed or _AUTOMATIC_FIELD.search(signal.name) or _signal_is_contextual(signal.name):
+                    continue
+                samples = [(frame["time_ns"], value) for frame in group
+                           if (value := signal.decode(frame["payload"])) is not None]
+                values = [value for _, value in samples]
+                if len(values) < 2 * MIN_STATE_FRAMES:
+                    continue
+                counts = Counter(values)
+                longest: dict[int, int] = defaultdict(int)
+                longest_duration: dict[int, int] = defaultdict(int)
+                previous, run, run_start = None, 0, 0
+                for timestamp, value in samples:
+                    if value != previous:
+                        run_start = timestamp
+                    run = run + 1 if value == previous else 1
+                    longest[value] = max(longest[value], run)
+                    longest_duration[value] = max(longest_duration[value], timestamp - run_start)
+                    previous = value
+                min_count = max(5, math.ceil(.02 * len(values)))
+                supported = sorted(value for value, count in counts.items()
+                                   if count >= min_count and longest[value] >= 5
+                                   and longest_duration[value] >= 1_000_000_000)
+                if len(supported) < 2:
+                    continue
+                envelopes[(bus, can_id, signal.name)] = {
+                    "supported_values": supported,
+                    "support_counts": [
+                        {"value": value, "count": counts[value],
+                         "longest_run": longest[value],
+                         "longest_run_ms": round(longest_duration[value] / 1e6, 3)}
+                        for value in supported
+                    ],
+                    "frame_count": len(values),
+                    "spread_raw": supported[-1] - supported[0],
+                }
+    return envelopes
+
+
+def _within_trial_envelopes(
+    trial: Mapping[str, Any], layouts: Mapping[int, Any],
+) -> dict[tuple[str, int, str], dict[str, Any]]:
+    return {
+        key: {"before_values": evidence["supported_values"],
+              "after_values": evidence["supported_values"],
+              "max_shift_raw": evidence["spread_raw"],
+              "pre_exposure_evidence": {"trial": evidence}}
+        for key, evidence in _pre_exposure_envelopes(trial, layouts).items()
+    }
+
+
+def _paired_background_envelopes(
+    mutation: Mapping[str, Any], noop: Mapping[str, Any], layouts: Mapping[int, Any],
+) -> dict[tuple[str, int, str], dict[str, Any]]:
+    first = _pre_exposure_envelopes(mutation, layouts)
+    second = _pre_exposure_envelopes(noop, layouts)
+    result: dict[tuple[str, int, str], dict[str, Any]] = {}
+    for key, m_evidence in first.items():
+        n_evidence = second.get(key)
+        if n_evidence is None:
+            continue
+        m_values = set(m_evidence["supported_values"])
+        n_values = set(n_evidence["supported_values"])
+        if not m_values & n_values:
+            continue
+        result[key] = {
+            "before_values": m_evidence["supported_values"],
+            "after_values": n_evidence["supported_values"],
+            "max_shift_raw": max(m_evidence["spread_raw"], n_evidence["spread_raw"]),
+            "pre_exposure_evidence": {"mutation": m_evidence, "noop": n_evidence},
+        }
+    return result
+
+
 def _compare_windows(
     before: Mapping[str, list[dict[str, Any]]],
     after: Mapping[str, list[dict[str, Any]]],
     target_id: int, layouts: Mapping[int, Any], label: str,
+    *, background_trends: Mapping[tuple[str, int, str], Any] | None = None,
+    background_envelopes: Mapping[tuple[str, int, str], Any] | None = None,
+    extra_step_tolerance: Mapping[tuple[int, str], int] | None = None,
 ) -> dict[str, Any]:
     """Use robust rate markers and stable non-contextual DBC signals.
 
@@ -426,10 +644,50 @@ def _compare_windows(
                 lmode, lcount = Counter(lvals).most_common(1)[0]
                 rmode, rcount = Counter(rvals).most_common(1)[0]
                 if lcount / len(lvals) >= .9 and rcount / len(rvals) >= .9 and lmode != rmode:
-                    row.setdefault("signal_changes", []).append({
-                        "signal": signal.name, "before": lmode, "after": rmode,
-                    })
-                    errors.append(f"{label}: {bus.upper()} 0x{can_id:X} {signal.name} state changed")
+                    signal_key = can_id, signal.name
+                    pair_tolerance = (extra_step_tolerance or {}).get(signal_key)
+                    tolerance = (pair_tolerance if pair_tolerance is not None
+                                 else STATE_RAW_STEP_TOLERANCE.get(signal.name, 0))
+                    delta = abs(lmode - rmode)
+                    change = {"signal": signal.name, "before": lmode, "after": rmode,
+                              "delta_raw": delta, "tolerance_raw": tolerance}
+                    physical = PAIR_SIGNAL_PHYSICAL_SCALE.get(signal_key)
+                    if physical is not None:
+                        scale, unit = physical
+                        change.update(delta_physical=round(delta * scale, 6),
+                                      tolerance_physical=round(tolerance * scale, 6),
+                                      unit=unit)
+                    trend = (background_trends or {}).get((bus, can_id, signal.name))
+                    envelope = (background_envelopes or {}).get((bus, can_id, signal.name))
+                    # An explicit pair limit takes precedence over a measured
+                    # background trend: larger changes must stay in the log.
+                    if pair_tolerance is not None and delta <= pair_tolerance:
+                        row.setdefault("tolerated_signal_drift", []).append(change)
+                    elif pair_tolerance is not None:
+                        row.setdefault("signal_changes", []).append(change)
+                        errors.append(
+                            f"{label}: {bus.upper()} 0x{can_id:X} {signal.name} "
+                            f"state changed ({delta} raw > tolerance {pair_tolerance} raw)"
+                        )
+                    elif trend is not None:
+                        row.setdefault("background_signal_drift", []).append({
+                            **change, "pre_exposure_evidence": trend,
+                        })
+                    elif (envelope is not None
+                          and lmode in envelope["before_values"]
+                          and rmode in envelope["after_values"]
+                          and abs(lmode - rmode) <= envelope["max_shift_raw"]):
+                        row.setdefault("background_signal_envelope", []).append({
+                            **change, "pre_exposure_evidence": envelope["pre_exposure_evidence"],
+                        })
+                    elif tolerance and delta <= tolerance:
+                        row.setdefault("tolerated_signal_drift", []).append(change)
+                    else:
+                        row.setdefault("signal_changes", []).append(change)
+                        errors.append(
+                            f"{label}: {bus.upper()} 0x{can_id:X} {signal.name} "
+                            f"state changed ({delta} raw > tolerance {tolerance} raw)"
+                        )
             markers.append(row)
         if bus_markers == 0:
             errors.append(f"{label}: {bus.upper()} has no sufficiently sampled common state marker")
@@ -480,14 +738,23 @@ def _candidate_recovery_checks(trial: Mapping[str, Any]) -> list[dict[str, Any]]
             bgaps = [b["time_ns"] - a["time_ns"] for a, b in zip(before, before[1:])]
             agaps = [b["time_ns"] - a["time_ns"] for a, b in zip(after, after[1:])]
             bmed, amed = statistics.median(bgaps), statistics.median(agaps)
+            bmean, amean = statistics.fmean(bgaps), statistics.fmean(agaps)
             bstd, astd = statistics.pstdev(bgaps), statistics.pstdev(agaps)
-            material = ((abs(amed - bmed) >= 2_000_000 and
-                         abs(amed - bmed) / max(bmed, 1) >= .25)
-                        or astd - bstd >= 2_000_000)
+            median_shift = (abs(amed - bmed) >= 2_000_000 and
+                            abs(amed - bmed) / max(bmed, 1) >= .25)
+            mean_shift = (abs(amean - bmean) >= 2_000_000 and
+                          abs(amean - bmean) / max(bmean, 1) >= .25)
+            # A multimodal cadence can move its median by one sample while
+            # the rate and full-window interval distribution stay unchanged.
+            material = ((median_shift and mean_shift) or astd - bstd >= 2_000_000)
             row.update(status="changed" if material else "restored",
                        reason="late recovery timing differs" if material else "late recovery timing matches",
                        normal_median_ms=round(bmed / 1e6, 3),
-                       recovery_median_ms=round(amed / 1e6, 3))
+                       recovery_median_ms=round(amed / 1e6, 3),
+                       normal_mean_ms=round(bmean / 1e6, 3),
+                       recovery_mean_ms=round(amean / 1e6, 3),
+                       normal_stddev_ms=round(bstd / 1e6, 3),
+                       recovery_stddev_ms=round(astd / 1e6, 3))
         elif kind == "PAYLOAD_CHANGE" and len(before) >= 3 and len(after) >= 3:
             evidence = event.get("evidence") or {}
             signal = next((item for item in layouts.get(can_id, ())
@@ -538,10 +805,13 @@ def recovery_returned_to_prestate(
         baseline = _window(trial, "baseline")
         normal = _window(trial, "normal")
         recovery = _window(trial, "recovery")
+        background_envelopes = _within_trial_envelopes(trial, layouts)
         pre = _compare_windows(baseline, normal, mutation.can_id, layouts,
-                               "baseline-to-normal")
+                               "baseline-to-normal",
+                               background_envelopes=background_envelopes)
         restored = _compare_windows(normal, recovery, mutation.can_id, layouts,
-                                    "normal-to-recovery")
+                                    "normal-to-recovery",
+                                    background_envelopes=background_envelopes)
         state_comparison = {"pre_exposure_stability": pre, "recovery": restored}
         errors.extend(pre["reasons"])
         errors.extend(restored["reasons"])
@@ -591,6 +861,28 @@ def _unverified(item: Mapping[str, Any]) -> dict[str, Any]:
             "type": item.get("type"), "score": item.get("score"),
             "evidence": evidence,
             "verification_status": "unverified", "feedback_eligible": False}
+
+
+def _paired_tolerances_report(
+    tolerances: Mapping[tuple[int, str], int], elapsed_seconds: float,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for (can_id, name), tolerance in sorted(tolerances.items()):
+        row: dict[str, Any] = {"id": f"0x{can_id:X}", "signal": name,
+                               "tolerance_raw": tolerance}
+        physical = PAIR_SIGNAL_PHYSICAL_SCALE.get((can_id, name))
+        if physical is not None:
+            scale, unit = physical
+            row.update(tolerance_physical=round(tolerance * scale, 6), unit=unit)
+        if (can_id, name) == FUEL_SIGNAL_KEY:
+            row["elapsed_fuel_allowance"] = {
+                "baseline_raw": PAIR_RAW_STEP_TOLERANCE[FUEL_SIGNAL_KEY],
+                "elapsed_seconds": round(elapsed_seconds, 3),
+                "modeled_rate_l_per_hour": FUEL_PAIR_DRIFT_L_PER_HOUR,
+                "cap_raw": FUEL_PAIR_MAX_RAW_STEPS,
+            }
+        rows.append(row)
+    return rows
 
 
 def analyze_trial_pair(
@@ -683,16 +975,37 @@ def analyze_trial_pair(
                 state_comparison[f"{role}_source_original"] = source_evidence
                 if source_evidence["status"] == "source_target_prestate_unobserved":
                     reasons.append(f"{role}: source_target_prestate_unobserved")
-        if first_gate["status"] != "stable":
-            reasons.append("first episode did not demonstrably return to pre-exposure state")
-        if second_gate["status"] != "stable":
-            reasons.append("second episode did not demonstrably return to pre-exposure state")
+        for position, gate in (("first", first_gate), ("second", second_gate)):
+            if gate["status"] != "stable":
+                # The trial's clock/capture errors are already in reasons. A
+                # generic recovery failure would misstate a quality-only gate.
+                new_reasons = [reason for reason in gate["reasons"] if reason not in reasons]
+                reasons.extend(f"{position} recovery: {reason}" for reason in new_reasons)
+                if not gate["reasons"]:
+                    reasons.append(f"{position} recovery gate is inconclusive")
         if "frames" in mutation and "frames" in noop:
             layouts = _signal_layout(mutation)
+            background_trends = _paired_background_trends(mutation, noop, layouts)
+            background_envelopes = _paired_background_envelopes(mutation, noop, layouts)
+            pair_elapsed_seconds = abs(
+                mutation["phases"]["baseline_start"] - noop["phases"]["baseline_start"]
+            ) / 1e9
+            pair_tolerances = _paired_step_tolerances(pair_elapsed_seconds)
+            state_comparison["pre_exposure_background_trends"] = [
+                {"bus": bus.upper(), "id": f"0x{can_id:X}", "signal": name,
+                 "evidence": evidence}
+                for (bus, can_id, name), evidence in sorted(background_trends.items())
+            ]
+            state_comparison["paired_signal_tolerances"] = _paired_tolerances_report(
+                pair_tolerances, pair_elapsed_seconds,
+            )
             for phase in ("baseline", "normal"):
                 comparison = _compare_windows(
                     _window(mutation, phase), _window(noop, phase),
                     mcase.can_id, layouts, f"paired {phase}",
+                    background_trends=background_trends,
+                    background_envelopes=background_envelopes,
+                    extra_step_tolerance=pair_tolerances,
                 )
                 state_comparison[f"paired_{phase}"] = comparison
                 reasons.extend(comparison["reasons"])

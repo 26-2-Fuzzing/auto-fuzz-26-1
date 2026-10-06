@@ -741,27 +741,44 @@ def analyze_trial(
                 control_cycle = control_stats["median_cycle_time_ms"]
                 mutation_cycle = mutation_stats["median_cycle_time_ms"]
                 absolute_change = abs(mutation_cycle - control_cycle)
+                control_mean = control_stats["mean_cycle_time_ms"]
+                mutation_mean = mutation_stats["mean_cycle_time_ms"]
+                mean_change = _relative(control_mean, mutation_mean)
+                median_shift = (cycle_change is not None and cycle_change >= timing_threshold
+                                and absolute_change >= 2.0)
+                mean_shift = (mean_change is not None and mean_change >= timing_threshold
+                              and abs(mutation_mean - control_mean) >= 2.0)
                 control_stddev = control_stats["cycle_time_stddev_ms"] or 0.0
                 mutation_stddev = mutation_stats["cycle_time_stddev_ms"] or 0.0
                 jitter_increase = max(0.0, mutation_stddev - control_stddev)
                 bursty_control = bool(control_cycle and control_stddev > 0.5 * control_cycle)
-                if (
-                    (cycle_change is not None and cycle_change >= timing_threshold and absolute_change >= 2.0)
-                    or jitter_increase >= timing_absolute
-                ):
+                timing_evidence = common | {
+                    "control_median_ms": control_cycle,
+                    "mutation_median_ms": mutation_cycle,
+                    "control_mean_ms": control_mean,
+                    "mutation_mean_ms": mutation_mean,
+                    "control_stddev_ms": control_stddev,
+                    "mutation_stddev_ms": mutation_stddev,
+                    "relative_change": cycle_change,
+                    "mean_relative_change": mean_change,
+                }
+                if (median_shift and mean_shift) or jitter_increase >= timing_absolute:
                     emit(key, "TIMING", max(
-                        _score(cycle_change or 0.0, timing_threshold) if cycle_change is not None else 0.0,
+                        _score(cycle_change or 0.0, timing_threshold) if median_shift and mean_shift else 0.0,
                         _score(jitter_increase, timing_absolute) if jitter_increase >= timing_absolute else 0.0,
-                    ), "inconclusive" if bursty_control else timing_class, common | {
-                        "control_median_ms": control_cycle,
-                        "mutation_median_ms": mutation_cycle,
-                        "control_stddev_ms": control_stddev,
-                        "mutation_stddev_ms": mutation_stddev,
-                        "relative_change": cycle_change,
+                    ), "inconclusive" if bursty_control else timing_class, timing_evidence | {
                         "reason": (
                             "bursty_control_not_periodic" if bursty_control else
                             "control_mode_unstable" if stationarity["status"] == "transitioning"
                             else "cycle_changed"
+                        ),
+                    })
+                elif median_shift:
+                    emit(key, "TIMING", 0.0, "inconclusive", timing_evidence | {
+                        "reason": (
+                            "bursty_control_not_periodic" if bursty_control else
+                            "control_mode_unstable" if stationarity["status"] == "transitioning"
+                            else "median_shift_without_mean_rate_change"
                         ),
                     })
             elif count_after and count_before != count_after:

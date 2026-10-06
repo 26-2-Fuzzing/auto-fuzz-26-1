@@ -215,6 +215,10 @@ def validate_cycle_plan(plan: Mapping[str, Any], *, dbc_path: str | Path | None 
         ledger = plan["completed_pairs"]
         if not isinstance(ledger, list) or len(ledger) > len(scheduled):
             raise ValueError("invalid cycle completion ledger")
+        if any(not isinstance(item, Mapping) or item.get(
+            "comparability_status", "comparable"
+        ) not in {"comparable", "inconclusive"} for item in ledger):
+            raise ValueError("invalid cycle pair comparability status")
         if [item["entry_index"] for item in ledger] != scheduled[:len(ledger)]:
             raise ValueError("cycle ledger is not a scheduled prefix")
         if len({item["pair_id"] for item in ledger}) != len(ledger):
@@ -277,15 +281,23 @@ def make_cycle_mutation(
     )
 
 
-def advance_cycle(plan: Mapping[str, Any], entry_index: int, pair_id: str) -> dict[str, Any]:
-    """Advance only after the caller has persisted a comparable completed pair."""
+def advance_cycle(
+    plan: Mapping[str, Any], entry_index: int, pair_id: str,
+    *, comparability_status: str = "comparable",
+) -> dict[str, Any]:
+    """Advance after the caller has reconciled a completed pair and its evidence."""
     entry = next_cycle_entry(plan)
     if entry is None or entry["index"] != entry_index:
         raise ValueError("cycle can advance only its next scheduled entry")
     if not isinstance(pair_id, str) or not pair_id.startswith("pair_") or not pair_id[5:].isdigit():
         raise ValueError("pair_id must identify a persisted pair")
+    if comparability_status not in {"comparable", "inconclusive"}:
+        raise ValueError("invalid cycle pair comparability status")
     updated = copy.deepcopy(dict(plan))
-    updated["completed_pairs"].append({"entry_index": entry_index, "pair_id": pair_id})
+    recorded = {"entry_index": entry_index, "pair_id": pair_id}
+    if comparability_status == "inconclusive":
+        recorded["comparability_status"] = comparability_status
+    updated["completed_pairs"].append(recorded)
     updated["cursor"] = entry_index + 1
     updated["status"] = "completed" if len(updated["completed_pairs"]) == updated["scheduled_count"] else "active"
     validate_cycle_plan(updated)

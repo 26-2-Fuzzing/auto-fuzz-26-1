@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import io
 import json
 import shutil
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -34,6 +36,9 @@ class QuietManager:
         del command, stdout_path
         self.started += 1
         raise AssertionError("no remote process should have started")
+
+    def clock_sample(self):
+        return {"offset_ms": 0.0, "round_trip_ms": 0.2}
 
     def close(self):
         pass
@@ -158,6 +163,82 @@ class PairRunnerTests(unittest.TestCase):
             manifest = json.loads((store.path / "pairs" / "pair_0001.json").read_text())
             self.assertEqual(manifest["status"], "blocked")
 
+    def test_advisory_inconclusive_recovery_is_recorded_and_second_episode_runs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner, store, selector = self.make_runner(Path(directory))
+            calls = []
+
+            def record(**kwargs):
+                calls.append(kwargs["expected_trial_id"])
+                return self.write_completed_episode(**kwargs)
+
+            runner.run_trial = record
+            output = io.StringIO()
+            with patch("experiment_runner.recovery_returned_to_prestate", return_value={
+                "status": "inconclusive", "reasons": ["source mode changed"],
+            }), patch("experiment_runner.analyze_trial_pair", return_value={
+                "comparability": {"status": "inconclusive", "reasons": ["source mode changed"]},
+            }), redirect_stdout(output):
+                runner.run_paired_set(
+                    store=store, source_bus="b_can", can_id=0x366,
+                    random_seed=366, selector=selector, dbc_path=None,
+                    continue_inconclusive=True,
+                )
+
+            self.assertEqual(calls, [1, 2])
+            manifest = json.loads((store.path / "pairs" / "pair_0001.json").read_text())
+            self.assertEqual(manifest["status"], "completed")
+            self.assertEqual(manifest["recovery_gate"], {
+                "status": "inconclusive", "reasons": ["source mode changed"],
+            })
+            self.assertEqual(manifest["comparability_status"], "inconclusive")
+            self.assertTrue((store.path / "pairs" / manifest["pair_report"]).is_file())
+            self.assertIn("[WARN] pair_0001 first recovery inconclusive", output.getvalue())
+            recovery_advisory = next(item for item in manifest["advisories"]
+                                     if item["stage"] == "first_recovery")
+            self.assertEqual(recovery_advisory["reasons"], ["source mode changed"])
+
+    def test_advisory_resume_after_strict_recovery_block_does_not_reinject_first(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner, store, selector = self.make_runner(Path(directory))
+            calls = []
+
+            def record(**kwargs):
+                calls.append(kwargs["expected_trial_id"])
+                return self.write_completed_episode(**kwargs)
+
+            runner.run_trial = record
+            with patch("experiment_runner.recovery_returned_to_prestate", return_value={
+                "status": "inconclusive", "reasons": ["source mode changed"],
+            }) as recovery, patch("experiment_runner.analyze_trial_pair", return_value={
+                "comparability": {"status": "inconclusive", "reasons": ["source mode changed"]},
+            }):
+                with self.assertRaisesRegex(RuntimeError, "prestate gate"):
+                    runner.run_paired_set(
+                        store=store, source_bus="b_can", can_id=0x366,
+                        random_seed=366, selector=selector, dbc_path=None,
+                    )
+                self.assertEqual(calls, [1])
+                blocked = json.loads((store.path / "pairs" / "pair_0001.json").read_text())
+                self.assertEqual(blocked["status"], "blocked")
+                self.assertEqual(blocked["recovery_gate"]["status"], "inconclusive")
+
+                runner.run_paired_set(
+                    store=store, source_bus="b_can", can_id=0x366,
+                    random_seed=366, selector=selector, dbc_path=None,
+                    continue_inconclusive=True,
+                )
+
+            self.assertEqual(recovery.call_count, 2)
+            self.assertEqual(calls, [1, 2])
+            manifest = json.loads((store.path / "pairs" / "pair_0001.json").read_text())
+            self.assertEqual(manifest["status"], "completed")
+            self.assertEqual(manifest["comparability_status"], "inconclusive")
+            self.assertTrue((store.path / "pairs" / manifest["pair_report"]).is_file())
+            recovery_advisory = next(item for item in manifest["advisories"]
+                                     if item["stage"] == "first_recovery")
+            self.assertEqual(recovery_advisory["reasons"], ["source mode changed"])
+
     def test_completed_first_episode_can_resume_without_reinjection(self):
         with tempfile.TemporaryDirectory() as directory:
             runner, store, selector = self.make_runner(Path(directory))
@@ -219,6 +300,35 @@ class PairRunnerTests(unittest.TestCase):
             manifest = json.loads((store.path / "pairs" / "pair_0001.json").read_text())
             self.assertEqual(manifest["comparability_status"], "inconclusive")
 
+    def test_advisory_inconclusive_report_allows_next_pair(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner, store, selector = self.make_runner(Path(directory))
+            calls = []
+
+            def record(**kwargs):
+                calls.append(kwargs["expected_trial_id"])
+                return self.write_completed_episode(**kwargs)
+
+            runner.run_trial = record
+            with patch("experiment_runner.recovery_returned_to_prestate", return_value={
+                "status": "stable", "reasons": [],
+            }), patch("experiment_runner.analyze_trial_pair", return_value={
+                "comparability": {"status": "inconclusive", "reasons": ["background drift"]},
+            }):
+                for _ in range(2):
+                    runner.run_paired_set(
+                        store=store, source_bus="b_can", can_id=0x366,
+                        random_seed=366, selector=selector, dbc_path=None,
+                        continue_inconclusive=True,
+                    )
+
+            self.assertEqual(calls, [1, 2, 3, 4])
+            for index in (1, 2):
+                manifest = json.loads((store.path / "pairs" / f"pair_{index:04d}.json").read_text())
+                self.assertEqual(manifest["status"], "completed")
+                self.assertEqual(manifest["comparability_status"], "inconclusive")
+                self.assertTrue((store.path / "pairs" / manifest["pair_report"]).is_file())
+
     def test_incomplete_episode_is_never_injected_again(self):
         with tempfile.TemporaryDirectory() as directory:
             runner, store, selector = self.make_runner(Path(directory))
@@ -241,6 +351,33 @@ class PairRunnerTests(unittest.TestCase):
                     random_seed=366, selector=selector, dbc_path=None,
                 )
             self.assertEqual(calls, [1])
+
+    def test_advisory_mode_still_blocks_incomplete_episode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner, store, selector = self.make_runner(Path(directory))
+            calls = []
+
+            def abort(**kwargs):
+                calls.append(kwargs["expected_trial_id"])
+                store.create_trial(kwargs["expected_trial_id"])
+                raise RuntimeError("capture lost")
+
+            runner.run_trial = abort
+            with self.assertRaisesRegex(RuntimeError, "capture lost"):
+                runner.run_paired_set(
+                    store=store, source_bus="b_can", can_id=0x366,
+                    random_seed=366, selector=selector, dbc_path=None,
+                    continue_inconclusive=True,
+                )
+            with self.assertRaisesRegex(RuntimeError, "cannot be safely resumed"):
+                runner.run_paired_set(
+                    store=store, source_bus="b_can", can_id=0x366,
+                    random_seed=366, selector=selector, dbc_path=None,
+                    continue_inconclusive=True,
+                )
+            self.assertEqual(calls, [1])
+            manifest = json.loads((store.path / "pairs" / "pair_0001.json").read_text())
+            self.assertEqual(manifest["status"], "blocked")
 
     def test_missing_first_completed_trial_never_reinjects(self):
         with tempfile.TemporaryDirectory() as directory:

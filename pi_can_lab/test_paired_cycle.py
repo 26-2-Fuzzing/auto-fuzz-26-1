@@ -121,6 +121,40 @@ class PairedCycleTests(unittest.TestCase):
         replayed = json.loads(json.dumps(advanced))
         self.assertEqual(next_cycle_entry(replayed)["index"], 1)
 
+    def test_inconclusive_pair_advances_with_auditable_legacy_compatible_ledger(self) -> None:
+        legacy = advance_cycle(copy.deepcopy(self.plan), 0, "pair_0001")
+        self.assertNotIn("comparability_status", legacy["completed_pairs"][0])
+        validate_cycle_plan(legacy, dbc_path=DBC)
+
+        explicit_legacy = copy.deepcopy(legacy)
+        explicit_legacy["completed_pairs"][0]["comparability_status"] = "comparable"
+        validate_cycle_plan(explicit_legacy, dbc_path=DBC)
+
+        second = next_cycle_entry(legacy)
+        advanced = advance_cycle(
+            legacy, second["index"], "pair_0002",
+            comparability_status="inconclusive",
+        )
+        self.assertEqual(advanced["schema_version"], 1)
+        self.assertEqual(advanced["catalog_sha256"], self.plan["catalog_sha256"])
+        self.assertEqual(advanced["completed_pairs"][-1], {
+            "entry_index": second["index"], "pair_id": "pair_0002",
+            "comparability_status": "inconclusive",
+        })
+        self.assertEqual(advanced["cursor"], second["index"] + 1)
+        self.assertEqual(next_cycle_entry(advanced)["index"], second["index"] + 1)
+        validate_cycle_plan(json.loads(json.dumps(advanced)), dbc_path=DBC)
+
+        with self.assertRaisesRegex(ValueError, "comparability status"):
+            advance_cycle(legacy, second["index"], "pair_0002", comparability_status="failed")
+        for invalid in ("failed", None, True):
+            tampered = copy.deepcopy(advanced)
+            tampered["completed_pairs"][-1]["comparability_status"] = invalid
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                ValueError, "comparability status"
+            ):
+                validate_cycle_plan(tampered)
+
     def test_case_is_frozen_exploration_without_parent_or_feedback(self) -> None:
         entry = next_cycle_entry(self.plan)
         mutation = make_cycle_mutation(

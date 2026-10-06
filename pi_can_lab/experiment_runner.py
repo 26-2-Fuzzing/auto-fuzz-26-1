@@ -24,7 +24,9 @@ from a5_0x366_mutator import A5BlinkmodiMutator, BASELINE_PAYLOAD, PROFILE_FAMIL
 from can_common import ConfigurationError, load_dbc, load_yaml_config, parse_can_data, parse_int
 from experiment_store import ExperimentStore
 from mutation_feedback import create_trial_feedback
-from pair_analysis import analyze_trial_pair, recovery_returned_to_prestate
+from pair_analysis import (
+    MAX_CLOCK_UNCERTAINTY_NS, analyze_trial_pair, recovery_returned_to_prestate,
+)
 from paired_cycle import (
     advance_cycle, build_cycle_plan, make_cycle_mutation,
     next_cycle_entry, validate_cycle_plan,
@@ -49,6 +51,11 @@ RECEIVER_CONFIGS = {
     "i_can": "receiver_i_can.yaml",
 }
 PHASE_NAMES = {"baseline", "normal", "mutation", "recovery"}
+PAIRED_CLOCK_SAMPLE_MULTIPLIER = 4
+
+
+class PairedClockPreflightError(RuntimeError):
+    """Clock evidence was insufficient before a paired trial was created."""
 
 
 def paired_order(random_seed: int, experiment_id: int, pair_index: int) -> list[str]:
@@ -398,24 +405,58 @@ class ExperimentRunner:
         for manager in self.managers.values():
             manager.close()
 
-    def check_clocks(self) -> dict[str, Any]:
+    def check_clocks(self, *, paired_source_bus: Optional[str] = None) -> dict[str, Any]:
         sync = self.config.get("time_sync", {})
         sample_count = max(1, int(sync.get("samples", 3)))
         warning_ms = float(sync.get("warning_threshold_ms", 50.0))
 
-        def one(bus: str) -> tuple[str, dict[str, Any]]:
-            samples = [self.managers[bus].clock_sample() for _ in range(sample_count)]
+        def selected(samples: list[dict[str, Any]]) -> dict[str, Any]:
             best = min(samples, key=lambda item: item["round_trip_ms"])
-            return bus, {
+            return {
                 **best, "samples": samples, "warning": abs(best["offset_ms"]) > warning_ms,
                 "reference_id": "shared-controller", "alignment_valid": True,
             }
 
+        def one(bus: str) -> tuple[str, dict[str, Any]]:
+            samples = [self.managers[bus].clock_sample() for _ in range(sample_count)]
+            return bus, selected(samples)
+
+        def insufficient(values: Mapping[str, Any]) -> dict[str, str]:
+            if paired_source_bus is None:
+                return {}
+            issues = {}
+            for bus in self.managers:
+                _, uncertainty, status = _clock_alignment(bus, paired_source_bus, values)
+                if status not in {"source_clock", "aligned"} or uncertainty is None:
+                    issues[bus] = f"clock alignment is {status}"
+                elif uncertainty > MAX_CLOCK_UNCERTAINTY_NS:
+                    issues[bus] = (
+                        f"uncertainty {uncertainty / 1e6:.3f} ms "
+                        f"> {MAX_CLOCK_UNCERTAINTY_NS / 1e6:g} ms"
+                    )
+            return issues
+
         with ThreadPoolExecutor(max_workers=3) as executor:
             values = dict(executor.map(one, self.managers))
+            if paired_source_bus is not None:
+                for _ in range(sample_count * (PAIRED_CLOCK_SAMPLE_MULTIPLIER - 1)):
+                    if not insufficient(values):
+                        break
+                    extra = dict(executor.map(
+                        lambda bus: (bus, self.managers[bus].clock_sample()), self.managers
+                    ))
+                    for bus, sample in extra.items():
+                        values[bus] = selected([*values[bus]["samples"], sample])
         for bus, value in values.items():
             if value["warning"]:
                 print(f"[WARN] {bus} clock offset={value['offset_ms']:.3f} ms > {warning_ms:g} ms")
+        issues = insufficient(values)
+        if issues:
+            detail = ", ".join(f"{bus}: {reason}" for bus, reason in sorted(issues.items()))
+            raise PairedClockPreflightError(
+                f"Paired clock preflight failed before transmission after "
+                f"{len(next(iter(values.values()))['samples'])} samples per host: {detail}"
+            )
         return values
 
     def probe_payload(self, source_bus: str, can_id: int, *, require_live: bool = False) -> bytes:
@@ -552,6 +593,16 @@ class ExperimentRunner:
             raise RuntimeError(
                 f"Pair expected trial {expected_trial_id}, but next available trial is {trial_id}"
             )
+        clocks = None
+        if pair_id is not None:
+            try:
+                clocks = self.check_clocks(paired_source_bus=source_bus)
+            except PairedClockPreflightError:
+                raise
+            except Exception as exc:
+                raise PairedClockPreflightError(
+                    f"Paired clock preflight failed before transmission: {exc}"
+                ) from exc
         trial_dir = store.create_trial(trial_id)
         metadata: dict[str, Any] = {
             "schema_version": 3,
@@ -643,7 +694,8 @@ class ExperimentRunner:
                 mutation = replace(mutation, signal=signal)
             store.write_json(trial_dir / "mutation.json", mutation.to_dict())
 
-            clocks = self.check_clocks()
+            if clocks is None:
+                clocks = self.check_clocks()
             metadata.update({
                 "status": "prepared",
                 "mutation_id": mutation.mutation_id,
@@ -672,6 +724,7 @@ class ExperimentRunner:
         try:
             self.capture.start_all(store.experiment_id, trial_id)
             captured = True
+            self.capture.wait_ready(store.experiment_id)
             time.sleep(max(0.0, float(trial_cfg.get("capture_start_delay_seconds", 1.0))))
             self.capture.assert_all_running()
             metadata["status"] = "running"
@@ -784,6 +837,7 @@ class ExperimentRunner:
         undefined_max_bits: int = 2,
         scheduled_mutation: Optional[MutationCase] = None,
         cycle_entry: Optional[Mapping[str, Any]] = None,
+        continue_inconclusive: bool = False,
     ) -> dict[str, Any]:
         """Execute or reconcile one frozen pair without repeating an uncertain TX."""
         pairs_dir = store.path / "pairs"
@@ -810,14 +864,17 @@ class ExperimentRunner:
             latest_path = indexed_paths[-1][1]
             with latest_path.open("r", encoding="utf-8") as handle:
                 latest = json.load(handle)
-            comparability = latest.get("comparability_status")
-            if comparability is None:
-                report_name = latest.get("pair_report")
-                if not isinstance(report_name, str) or Path(report_name).name != report_name:
-                    raise RuntimeError("Latest pair has no safe comparison report")
-                with (pairs_dir / report_name).open("r", encoding="utf-8") as handle:
-                    comparability = (json.load(handle).get("comparability") or {}).get("status")
-            if comparability != "comparable":
+            report_name = latest.get("pair_report")
+            if not isinstance(report_name, str) or Path(report_name).name != report_name:
+                raise RuntimeError("Latest pair has no safe comparison report")
+            with (pairs_dir / report_name).open("r", encoding="utf-8") as handle:
+                latest_report = json.load(handle)
+            comparability = (latest_report.get("comparability") or {}).get("status")
+            if (latest_report.get("pair_id", latest_path.stem) != latest_path.stem
+                    or latest.get("comparability_status", comparability) != comparability
+                    or comparability not in ("comparable", "inconclusive")):
+                raise RuntimeError("Latest pair comparison record is inconsistent")
+            if comparability != "comparable" and not continue_inconclusive:
                 raise RuntimeError("Latest pair comparison is inconclusive; campaign is paused")
 
         if pending:
@@ -973,11 +1030,15 @@ class ExperimentRunner:
                     f"{pair_id} is missing a previously completed trial; refusing reinjection"
                 )
             # A crash after a fully completed first episode can safely resume
-            # at the second episode. An incomplete trial or failed state gate
-            # never gets another automatic injection attempt.
+            # at the second episode. An incomplete trial never gets another
+            # automatic injection attempt.
             resume_after_completed_first = (
                 position == 2 and pair["status"] == "blocked"
-                and "recovery_gate" not in pair
+                and ("recovery_gate" not in pair or (
+                    continue_inconclusive
+                    and (pair.get("recovery_gate") or {}).get("status") == "inconclusive"
+                    and "interruption" not in pair
+                ))
             )
             if pair["status"] == "blocked" and not resume_after_completed_first:
                 raise RuntimeError(f"{pair_id} is blocked; incomplete trials are never reinjected")
@@ -991,8 +1052,21 @@ class ExperimentRunner:
                     raise
                 save_pair("first_completed", recovery_gate=gate)
                 if gate.get("status") != "stable":
-                    save_pair("blocked")
-                    raise RuntimeError(f"{pair_id} first recovery did not pass the prestate gate")
+                    if gate.get("status") != "inconclusive":
+                        save_pair("blocked")
+                        raise RuntimeError(f"{pair_id} first recovery gate returned an invalid status")
+                    if not continue_inconclusive:
+                        save_pair("blocked")
+                        raise RuntimeError(f"{pair_id} first recovery did not pass the prestate gate")
+                    advisory = {
+                        "stage": "first_recovery", "status": "inconclusive",
+                        "reasons": gate.get("reasons", []), "recorded_at": utc_now(),
+                    }
+                    save_pair("first_completed", advisories=[
+                        *[item for item in pair.get("advisories", [])
+                          if item.get("stage") != "first_recovery"], advisory,
+                    ])
+                    print(f"[WARN] {pair_id} first recovery inconclusive; recorded and continuing")
             case = control if kind == "noop" else mutation
             episode_decision = (
                 StrategyDecision("CONTROL", "NOOP", None, None, case.generation_reason)
@@ -1008,6 +1082,17 @@ class ExperimentRunner:
                     prepared_case=case, prepared_decision=episode_decision,
                     cycle_entry=pair.get("cycle_entry"),
                 )
+            except PairedClockPreflightError as exc:
+                if (store.path / f"trial_{trial_id:04d}").exists():
+                    save_pair("blocked", interruption=f"{type(exc).__name__}: {exc}")
+                else:
+                    save_pair(
+                        "prepared" if position == 1 else "first_completed",
+                        last_clock_preflight_failure={
+                            "trial_id": trial_id, "error": str(exc), "at": utc_now(),
+                        },
+                    )
+                raise
             except BaseException as exc:
                 save_pair("blocked", interruption=f"{type(exc).__name__}: {exc}")
                 raise
@@ -1025,12 +1110,24 @@ class ExperimentRunner:
         report_path = pairs_dir / f"{pair_id}_report.json"
         store.write_json(report_path, report)
         comparability = (report.get("comparability") or {}).get("status", "inconclusive")
+        if comparability not in ("comparable", "inconclusive"):
+            raise RuntimeError(f"{pair_id} comparison returned an invalid status")
+        if comparability == "inconclusive" and continue_inconclusive:
+            pair["advisories"] = [
+                *[item for item in pair.get("advisories", [])
+                  if item.get("stage") != "pair_comparison"],
+                {"stage": "pair_comparison", "status": "inconclusive",
+                 "reasons": (report.get("comparability") or {}).get("reasons", []),
+                 "recorded_at": utc_now()},
+            ]
         save_pair("completed", pair_report=report_path.name,
                   comparability_status=comparability)
         print(f"[PAIR] {pair_id}: {pair['pair_order'][0]} → {pair['pair_order'][1]}; "
               f"comparison={comparability}")
-        if comparability != "comparable":
+        if comparability != "comparable" and not continue_inconclusive:
             raise RuntimeError(f"{pair_id} comparison is inconclusive; campaign is paused")
+        if comparability == "inconclusive":
+            print(f"[WARN] {pair_id} comparison inconclusive; recorded and continuing")
         return report
 
     @_with_trial_lock
@@ -1044,6 +1141,7 @@ class ExperimentRunner:
         dbc_path: Path,
         undefined_max_bits: int = 2,
         max_sets: int = 10,
+        continue_inconclusive: bool = False,
     ) -> dict[str, Any]:
         """Run a bounded slice of one frozen eight-family 0x366 catalogue."""
         if max_sets < 1:
@@ -1128,20 +1226,29 @@ class ExperimentRunner:
 
         def reconcile_completed_pair(
             existing: tuple[Path, dict[str, Any]], entry: Mapping[str, Any]
-        ) -> str:
+        ) -> tuple[str, str]:
             path, document = existing
             if document.get("status") != "completed":
                 raise RuntimeError(f"{path.stem} is unfinished and cannot advance the cycle")
-            if document.get("comparability_status") != "comparable":
-                raise RuntimeError(f"{path.stem} is inconclusive; cycle remains paused")
             report_name = document.get("pair_report")
             if not isinstance(report_name, str) or Path(report_name).name != report_name:
                 raise RuntimeError(f"{path.stem} has no safe comparison report")
             with (pairs_dir / report_name).open("r", encoding="utf-8") as handle:
                 report = json.load(handle)
+            comparability = (report.get("comparability") or {}).get("status")
             if (report.get("pair_id") != path.stem
-                    or (report.get("comparability") or {}).get("status") != "comparable"):
-                raise RuntimeError(f"{path.stem} report does not confirm comparability")
+                    or comparability not in ("comparable", "inconclusive")
+                    or document.get("comparability_status") != comparability):
+                raise RuntimeError(f"{path.stem} report and manifest comparison disagree")
+            if comparability == "inconclusive" and not continue_inconclusive:
+                raise RuntimeError(f"{path.stem} is inconclusive; cycle remains paused")
+            if comparability == "inconclusive":
+                tx = report.get("tx_comparison") or {}
+                if any((tx.get(role) or {}).get("status") != "valid"
+                       for role in ("mutation", "noop")):
+                    raise RuntimeError(
+                        f"{path.stem} has unverified TX evidence; advisory continuation is unavailable"
+                    )
             frozen = MutationCase.from_dict(document["frozen_mutation"])
             expected = make_cycle_mutation(
                 entry, mutation_id=frozen.mutation_id,
@@ -1185,7 +1292,7 @@ class ExperimentRunner:
                         or (recorded_case.trial_kind == "noop"
                             and recorded_case.mutated_payload != original)):
                     raise RuntimeError(f"{path.stem} trial {trial_id} record no longer matches")
-            return path.stem
+            return path.stem, comparability
 
         # The cursor alone is not evidence: audit every recorded completion
         # before starting the next scheduled exposure.
@@ -1199,7 +1306,9 @@ class ExperimentRunner:
                 document = json.load(handle)
             if document.get("cycle_entry") != cycle_link(entry):
                 raise RuntimeError(f"{pair_id} no longer matches the cycle ledger")
-            reconcile_completed_pair((path, document), entry)
+            _, comparability = reconcile_completed_pair((path, document), entry)
+            if recorded.get("comparability_status", "comparable") != comparability:
+                raise RuntimeError(f"{pair_id} cycle ledger comparison disagrees with the report")
 
         newly_executed = 0
         reconciled = 0
@@ -1225,6 +1334,7 @@ class ExperimentRunner:
                     random_seed=random_seed, selector=selector, dbc_path=dbc_path,
                     undefined_max_bits=undefined_max_bits,
                     scheduled_mutation=mutation, cycle_entry=link,
+                    continue_inconclusive=continue_inconclusive,
                 )
                 newly_executed += 1
                 existing = pair_for_entry(link)
@@ -1232,17 +1342,28 @@ class ExperimentRunner:
                     raise RuntimeError("Completed cycle pair has no persisted manifest")
             else:
                 reconciled += 1
-            pair_id = reconcile_completed_pair(existing, entry)
-            plan = advance_cycle(plan, entry["index"], pair_id)
+            pair_id, comparability = reconcile_completed_pair(existing, entry)
+            plan = advance_cycle(
+                plan, entry["index"], pair_id,
+                comparability_status=comparability,
+            )
             plan["updated_at"] = utc_now()
             store.write_json(cycle_path, plan)
         remaining = plan["scheduled_count"] - len(plan["completed_pairs"])
-        print(f"[CYCLE] {len(plan['completed_pairs'])}/{plan['scheduled_count']} comparable pairs; "
+        inconclusive_count = sum(
+            item.get("comparability_status", "comparable") == "inconclusive"
+            for item in plan["completed_pairs"]
+        )
+        comparable_count = len(plan["completed_pairs"]) - inconclusive_count
+        print(f"[CYCLE] {len(plan['completed_pairs'])}/{plan['scheduled_count']} processed pairs "
+              f"({comparable_count} comparable, {inconclusive_count} inconclusive); "
               f"{remaining} remaining; {newly_executed} executed this invocation")
         return {
             "status": plan["status"],
             "scheduled_count": plan["scheduled_count"],
             "completed_count": len(plan["completed_pairs"]),
+            "comparable_count": comparable_count,
+            "inconclusive_count": inconclusive_count,
             "remaining_count": remaining,
             "executed_this_invocation": newly_executed,
             "reconciled_this_invocation": reconciled,
@@ -1295,6 +1416,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="resume a frozen catalogue of distinct 0x366 family pairs")
     parser.add_argument("--cycle-max-sets", type=int,
                         help="maximum newly executed pairs this invocation (default: 10)")
+    parser.add_argument("--continue-inconclusive", action="store_true",
+                        help="record pair state/recovery uncertainty and continue the paired cycle")
     parser.add_argument("--random-seed", type=int, default=366)
     parser.add_argument("--reproduce-mutation-id", type=int, help="repeat one completed mutation exactly")
     parser.add_argument("--control-noop", action="store_true", help="send the original payload in the comparison slot; never add control feedback")
@@ -1322,6 +1445,7 @@ def run(args: argparse.Namespace) -> int:
     paired_sets = getattr(args, "paired_sets", 0)
     paired_cycle = getattr(args, "paired_cycle", False)
     cycle_max_sets = getattr(args, "cycle_max_sets", None)
+    continue_inconclusive = getattr(args, "continue_inconclusive", False)
     if paired_sets < 0:
         raise ConfigurationError("paired-sets cannot be negative")
     if paired_sets and (explicit_trials is not None or args.control_noop
@@ -1337,6 +1461,8 @@ def run(args: argparse.Namespace) -> int:
         )
     if cycle_max_sets is not None and not paired_cycle:
         raise ConfigurationError("--cycle-max-sets requires --paired-cycle")
+    if continue_inconclusive and not paired_cycle:
+        raise ConfigurationError("--continue-inconclusive requires --paired-cycle")
     cycle_max_sets = 10 if cycle_max_sets is None else cycle_max_sets
     if cycle_max_sets < 1:
         raise ConfigurationError("cycle-max-sets must be at least 1")
@@ -1406,9 +1532,14 @@ def run(args: argparse.Namespace) -> int:
                     raise RuntimeError("Frozen cycle was prepared with different runner settings")
                 completed = len(preview_plan["completed_pairs"])
                 remaining = preview_plan["scheduled_count"] - completed
+                inconclusive = sum(
+                    item.get("comparability_status", "comparable") == "inconclusive"
+                    for item in preview_plan["completed_pairs"]
+                )
                 phase_settings = preview_plan["execution_context"]["collection_config"]
                 print(f"[CYCLE] Frozen experiment {args.experiment_id}: "
-                      f"{completed}/{preview_plan['scheduled_count']} comparable pairs, "
+                      f"{completed}/{preview_plan['scheduled_count']} processed pairs "
+                      f"({completed - inconclusive} comparable, {inconclusive} inconclusive), "
                       f"{remaining} remaining")
             else:
                 reference = config.get("target", {}).get("reference_payload")
@@ -1437,6 +1568,8 @@ def run(args: argparse.Namespace) -> int:
             total_min = remaining * phase_min
             print(f"[CYCLE] Minimum phase time {total_min / 3600:.2f} hours "
                   f"({phase_min:g} seconds per pair); this invocation cap {cycle_max_sets} pairs")
+            if continue_inconclusive:
+                print("[CYCLE] Inconclusive state/recovery comparisons will be logged and continued.")
         if args.mutation_profile:
             print(f"[PROFILE] {args.mutation_profile} / undefined-max-bits={args.undefined_max_bits}")
         return 0
@@ -1460,6 +1593,7 @@ def run(args: argparse.Namespace) -> int:
                     store=store, source_bus=source_bus, random_seed=args.random_seed,
                     selector=selector, dbc_path=dbc_path,
                     undefined_max_bits=args.undefined_max_bits, max_sets=cycle_max_sets,
+                    continue_inconclusive=continue_inconclusive,
                 )
                 if result["status"] == "completed":
                     store.complete()

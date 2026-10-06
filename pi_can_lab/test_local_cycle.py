@@ -74,7 +74,10 @@ class LocalCycleTests(unittest.TestCase):
         return runner, store, TrialStrategySelector({}), dbc
 
     @staticmethod
-    def persist_completed_pair(store: ExperimentStore, *, reuse_pair_id=None, **kwargs):
+    def persist_completed_pair(
+        store: ExperimentStore, *, reuse_pair_id=None,
+        comparability_status="comparable", **kwargs,
+    ):
         pairs = store.path / "pairs"
         count = (
             int(reuse_pair_id.removeprefix("pair_")) if reuse_pair_id is not None
@@ -104,11 +107,19 @@ class LocalCycleTests(unittest.TestCase):
             for name in ("anomalies.json", "tx.jsonl", "p_can.jsonl", "b_can.jsonl", "i_can.jsonl"):
                 (trial_dir / name).write_text("{}\n", encoding="utf-8")
             store.record_completed_trial(case, feedback)
-        report = {"pair_id": pair_id, "comparability": {"status": "comparable"}}
+        report = {
+            "pair_id": pair_id,
+            "comparability": {"status": comparability_status},
+        }
+        if comparability_status == "inconclusive":
+            report["tx_comparison"] = {
+                "mutation": {"status": "valid"},
+                "noop": {"status": "valid"},
+            }
         store.write_json(pairs / f"{pair_id}.json", {
             "pair_id": pair_id,
             "status": "completed",
-            "comparability_status": "comparable",
+            "comparability_status": comparability_status,
             "pair_report": f"{pair_id}_report.json",
             "cycle_entry": kwargs["cycle_entry"],
             "frozen_mutation": kwargs["scheduled_mutation"].to_dict(),
@@ -118,6 +129,33 @@ class LocalCycleTests(unittest.TestCase):
         })
         store.write_json(pairs / f"{pair_id}_report.json", report)
         return report
+
+    def freeze_inconclusive_pair_before_cycle_ledger(
+        self, runner, store, selector, dbc,
+    ):
+        calls = []
+
+        def interrupted(**kwargs):
+            index = kwargs["cycle_entry"]["entry_index"]
+            calls.append(index)
+            report = self.persist_completed_pair(
+                comparability_status="inconclusive" if index == 0 else "comparable",
+                **kwargs,
+            )
+            if index == 0:
+                raise KeyboardInterrupt()
+            return report
+
+        runner.run_paired_set = interrupted
+        with patch("paired_cycle.A5BlinkmodiMutator", TwoCaseGenerator):
+            with self.assertRaises(KeyboardInterrupt):
+                runner.run_paired_cycle(
+                    store=store, source_bus="b_can", random_seed=366,
+                    selector=selector, dbc_path=dbc, max_sets=1,
+                )
+        plan = json.loads((store.path / "pairs" / "cycle.json").read_text())
+        self.assertEqual(plan["cursor"], 0)
+        return calls
 
     def test_cycle_cap_and_completion_keep_cursor_after_each_pair(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -178,6 +216,131 @@ class LocalCycleTests(unittest.TestCase):
             self.assertEqual(calls, [0, 1])
             self.assertEqual(resumed["reconciled_this_invocation"], 1)
             self.assertEqual(resumed["status"], "completed")
+
+    def test_advisory_resume_reconciles_inconclusive_pair_without_repeating_tx(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner, store, selector, dbc = self.make_runner(Path(directory))
+            calls = self.freeze_inconclusive_pair_before_cycle_ledger(
+                runner, store, selector, dbc,
+            )
+            with patch("paired_cycle.A5BlinkmodiMutator", TwoCaseGenerator):
+                resumed = runner.run_paired_cycle(
+                    store=store, source_bus="b_can", random_seed=366,
+                    selector=selector, dbc_path=dbc, max_sets=1,
+                    continue_inconclusive=True,
+                )
+            plan = json.loads((store.path / "pairs" / "cycle.json").read_text())
+            self.assertEqual(calls, [0, 1])
+            self.assertEqual(resumed["reconciled_this_invocation"], 1)
+            self.assertEqual(plan["cursor"], 2)
+            self.assertEqual(
+                plan["completed_pairs"][0]["comparability_status"], "inconclusive",
+            )
+            self.assertEqual(plan["completed_pairs"][1]["entry_index"], 1)
+
+    def test_strict_resume_keeps_completed_inconclusive_pair_paused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner, store, selector, dbc = self.make_runner(Path(directory))
+            calls = self.freeze_inconclusive_pair_before_cycle_ledger(
+                runner, store, selector, dbc,
+            )
+            with patch("paired_cycle.A5BlinkmodiMutator", TwoCaseGenerator):
+                with self.assertRaisesRegex(RuntimeError, "inconclusive|paused"):
+                    runner.run_paired_cycle(
+                        store=store, source_bus="b_can", random_seed=366,
+                        selector=selector, dbc_path=dbc, max_sets=1,
+                    )
+            plan = json.loads((store.path / "pairs" / "cycle.json").read_text())
+            self.assertEqual(calls, [0])
+            self.assertEqual(plan["cursor"], 0)
+
+    def test_advisory_resume_rejects_ledger_status_mismatch_before_next_tx(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner, store, selector, dbc = self.make_runner(Path(directory))
+            calls = []
+
+            def completed(**kwargs):
+                calls.append(kwargs["cycle_entry"]["entry_index"])
+                return self.persist_completed_pair(
+                    comparability_status="inconclusive", **kwargs,
+                )
+
+            runner.run_paired_set = completed
+            cycle_path = store.path / "pairs" / "cycle.json"
+            with patch("paired_cycle.A5BlinkmodiMutator", TwoCaseGenerator):
+                runner.run_paired_cycle(
+                    store=store, source_bus="b_can", random_seed=366,
+                    selector=selector, dbc_path=dbc, max_sets=1,
+                    continue_inconclusive=True,
+                )
+                plan = json.loads(cycle_path.read_text())
+                self.assertEqual(
+                    plan["completed_pairs"][0]["comparability_status"], "inconclusive",
+                )
+                del plan["completed_pairs"][0]["comparability_status"]
+                store.write_json(cycle_path, plan)
+                with self.assertRaises(RuntimeError):
+                    runner.run_paired_cycle(
+                        store=store, source_bus="b_can", random_seed=366,
+                        selector=selector, dbc_path=dbc, max_sets=1,
+                        continue_inconclusive=True,
+                    )
+            self.assertEqual(calls, [0])
+            self.assertFalse((store.path / "pairs" / "pair_0002.json").exists())
+
+    def test_advisory_resume_rejects_invalid_or_missing_tx_status_before_next_tx(self):
+        for status in ("invalid", "missing"):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
+                runner, store, selector, dbc = self.make_runner(Path(directory))
+                calls = self.freeze_inconclusive_pair_before_cycle_ledger(
+                    runner, store, selector, dbc,
+                )
+                report_path = store.path / "pairs" / "pair_0001_report.json"
+                report = json.loads(report_path.read_text())
+                if status == "invalid":
+                    report["tx_comparison"]["mutation"]["status"] = "invalid"
+                else:
+                    del report["tx_comparison"]["noop"]["status"]
+                store.write_json(report_path, report)
+                with patch("paired_cycle.A5BlinkmodiMutator", TwoCaseGenerator):
+                    with self.assertRaisesRegex(RuntimeError, "unverified TX evidence"):
+                        runner.run_paired_cycle(
+                            store=store, source_bus="b_can", random_seed=366,
+                            selector=selector, dbc_path=dbc, max_sets=1,
+                            continue_inconclusive=True,
+                        )
+                plan = json.loads((store.path / "pairs" / "cycle.json").read_text())
+                self.assertEqual(plan["cursor"], 0)
+                self.assertEqual(calls, [0])
+                self.assertFalse((store.path / "pairs" / "pair_0002.json").exists())
+
+    def test_advisory_resume_rejects_missing_trial_evidence_before_next_tx(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner, store, selector, dbc = self.make_runner(Path(directory))
+            calls = []
+
+            def completed(**kwargs):
+                calls.append(kwargs["cycle_entry"]["entry_index"])
+                return self.persist_completed_pair(
+                    comparability_status="inconclusive", **kwargs,
+                )
+
+            runner.run_paired_set = completed
+            with patch("paired_cycle.A5BlinkmodiMutator", TwoCaseGenerator):
+                runner.run_paired_cycle(
+                    store=store, source_bus="b_can", random_seed=366,
+                    selector=selector, dbc_path=dbc, max_sets=1,
+                    continue_inconclusive=True,
+                )
+                (store.path / "trial_0001" / "feedback.json").unlink()
+                with self.assertRaisesRegex(RuntimeError, "evidence is missing"):
+                    runner.run_paired_cycle(
+                        store=store, source_bus="b_can", random_seed=366,
+                        selector=selector, dbc_path=dbc, max_sets=1,
+                        continue_inconclusive=True,
+                    )
+            self.assertEqual(calls, [0])
+            self.assertFalse((store.path / "pairs" / "pair_0002.json").exists())
 
     def test_pending_pair_is_resumed_through_pair_safety_path(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -337,7 +500,8 @@ class LocalCycleTests(unittest.TestCase):
                 with patch("experiment_runner.ExperimentRunner",
                            side_effect=AssertionError("SSH opened")), redirect_stdout(output):
                     self.assertEqual(run(args), 0)
-            self.assertIn("Frozen experiment 42: 1/2 comparable pairs, 1 remaining",
+            self.assertIn("Frozen experiment 42: 1/2 processed pairs "
+                          "(1 comparable, 0 inconclusive), 1 remaining",
                           output.getvalue())
 
     def test_cycle_rejects_enabled_feedback_even_in_preview(self):

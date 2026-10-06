@@ -5,7 +5,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from pair_analysis import analyze_trial_pair, recovery_returned_to_prestate
+from pair_analysis import (
+    PAIR_RAW_STEP_TOLERANCE, _candidate_recovery_checks, _compare_windows,
+    _paired_background_envelopes,
+    _paired_background_trends, _paired_step_tolerances,
+    _paired_tolerances_report, _within_trial_envelopes,
+    analyze_trial_pair, recovery_returned_to_prestate,
+)
+from trial_analysis import SignalDefinition
 from trial_models import MutationCase
 
 
@@ -154,6 +161,271 @@ def _episode(root: Path, trial_id: int, kind: str, position: int, *,
 
 
 class PairAnalysisTests(unittest.TestCase):
+    def test_multimodal_timing_median_shift_does_not_fail_recovery(self) -> None:
+        def timing_trial(normal_gaps, recovery_gaps):
+            def frames(start, gaps):
+                timestamps = [start]
+                for gap in gaps:
+                    timestamps.append(timestamps[-1] + gap * 1_000_000)
+                return [{"id": 0x3C1, "time_ns": timestamp, "payload": b"\0"}
+                        for timestamp in timestamps]
+
+            return {
+                "phases": {"normal_start": 0, "normal_end": 10 * NS,
+                           "recovery_start": 11 * NS, "recovery_end": 31 * NS},
+                "frames": {"i_can": frames(5 * NS, normal_gaps)
+                           + frames(26 * NS, recovery_gaps)},
+                "metadata": {"dbc_path": None},
+                "analysis": {"anomalies": [{
+                    "classification": "candidate", "target_bus": "I_CAN",
+                    "target_id": "0x3C1", "type": "TIMING",
+                }]},
+            }
+
+        normal = [30] * 3 + [60] * 3 + [90] * 4 + [120] * 3
+        shifted_median = [30] * 3 + [60] * 4 + [90] * 3 + [120] * 3
+        check = _candidate_recovery_checks(timing_trial(normal, shifted_median))[0]
+        self.assertEqual(check["status"], "restored")
+        self.assertGreater(abs(check["normal_median_ms"] - check["recovery_median_ms"]), 20)
+        self.assertLess(abs(check["normal_mean_ms"] - check["recovery_mean_ms"]), 3)
+        self.assertEqual(_candidate_recovery_checks(timing_trial(
+            [90] * 13, [60] * 13,
+        ))[0]["status"], "changed")
+        self.assertEqual(_candidate_recovery_checks(timing_trial(
+            [75] * 13, [50, 100] * 6 + [50],
+        ))[0]["status"], "changed")
+
+    def test_pre_exposure_envelope_accepts_supported_values_only(self) -> None:
+        signal = SignalDefinition("MO_Mom_Begr_dyn", 0, 16, 1, False)
+        layouts = {0xA8: (signal,)}
+
+        def frames(values, offset=0):
+            return [{"id": 0xA8, "extended": False,
+                     "time_ns": offset + index * 500_000_000,
+                     "payload": value.to_bytes(2, "little")}
+                    for index, value in enumerate(values)]
+
+        def episode(values, offset=0):
+            return {"phases": {"baseline_start": offset, "normal_end": offset + 40 * NS},
+                    "mutation": MutationCase(
+                        mutation_id=1, source_bus="b_can", can_id=0x366,
+                        operator="TEST", original_payload=ORIGINAL,
+                        mutated_payload=CHANGED, random_seed=1,
+                    ), "frames": {"b_can": frames(values, offset)}}
+
+        mutation = episode([665] * 30 + [664] * 20 + [665] * 30)
+        noop = episode([664] * 30 + [665] * 20 + [664] * 30, 100 * NS)
+        within = _within_trial_envelopes(noop, layouts)
+        paired = _paired_background_envelopes(mutation, noop, layouts)
+        before, after = {"b_can": frames([665] * 10)}, {"b_can": frames([664] * 10)}
+        self.assertEqual(_compare_windows(
+            before, after, 0x366, layouts, "paired baseline",
+        )["status"], "inconclusive")
+        accepted = _compare_windows(
+            before, after, 0x366, layouts, "paired baseline",
+            background_envelopes=paired,
+        )
+        self.assertEqual(accepted["status"], "stable")
+        self.assertEqual(accepted["markers"][0]["background_signal_envelope"][0]
+                         ["pre_exposure_evidence"]["noop"]["supported_values"], [664, 665])
+        self.assertEqual(_compare_windows(
+            after, before, 0x366, layouts, "normal-to-recovery",
+            background_envelopes=within,
+        )["status"], "stable")
+        self.assertEqual(_compare_windows(
+            after, {"b_can": frames([663] * 10)}, 0x366, layouts,
+            "normal-to-recovery", background_envelopes=within,
+        )["status"], "inconclusive")
+        # A rare one-frame value does not become part of the accepted envelope.
+        noisy = episode([664] * 35 + [665] + [664] * 44, 100 * NS)
+        self.assertFalse(_paired_background_envelopes(mutation, noisy, layouts))
+
+    def test_pre_exposure_fuel_motion_is_scoped_to_paired_state(self) -> None:
+        signal = SignalDefinition("KBI_Tankinhalt_hochaufl", 0, 16, 1, False)
+        layouts = {0x6B8: (signal,)}
+
+        def frames(values, offset=0):
+            return [{"id": 0x6B8, "extended": False,
+                     "time_ns": offset + index * 500_000_000,
+                     "payload": value.to_bytes(2, "little")}
+                    for index, value in enumerate(values)]
+
+        def episode(values, offset=0):
+            return {"phases": {"baseline_start": offset, "normal_end": offset + 40 * NS},
+                    "mutation": MutationCase(
+                        mutation_id=1, source_bus="b_can", can_id=0x366,
+                        operator="TEST", original_payload=ORIGINAL,
+                        mutated_payload=CHANGED, random_seed=1,
+                    ), "frames": {"b_can": frames(values, offset)}}
+
+        mutation = episode([1479] * 30 + [1478] * 50)
+        noop = episode([1466] * 70 + [1465] * 10, 476 * NS)
+        trends = _paired_background_trends(mutation, noop, layouts)
+        before, after = {"b_can": frames([1478] * 10)}, {"b_can": frames([1466] * 10)}
+        paired = _compare_windows(
+            before, after, 0x366, layouts, "paired baseline", background_trends=trends,
+        )
+        self.assertEqual(paired["status"], "stable")
+        self.assertEqual(paired["markers"][0]["background_signal_drift"][0]
+                         ["pre_exposure_evidence"]["mutation"]["direction"], "down")
+        self.assertLessEqual(trends[("b_can", 0x6B8, signal.name)]["observed_shift_raw"],
+                             trends[("b_can", 0x6B8, signal.name)]["max_shift_raw"])
+        self.assertIn(("b_can", 0x6B8, signal.name),
+                      _paired_background_trends(noop, mutation, layouts))
+        short_but_sustained = episode([1466] * 71 + [1465] * 9, 476 * NS)
+        self.assertIn(("b_can", 0x6B8, signal.name),
+                      _paired_background_trends(mutation, short_but_sustained, layouts))
+        one_off = episode([1466] * 76 + [1465] * 4, 476 * NS)
+        self.assertFalse(_paired_background_trends(mutation, one_off, layouts))
+        # A change first seen after exposure supplies no pre-exposure trend.
+        no_trend = _paired_background_trends(
+            mutation, episode([1466] * 80, 476 * NS), layouts,
+        )
+        self.assertFalse(no_trend)
+        self.assertEqual(_compare_windows(
+            before, after, 0x366, layouts, "paired baseline",
+            background_trends=no_trend,
+        )["status"], "inconclusive")
+        # A much larger state shift is not explained by the measured drift rate.
+        self.assertFalse(_paired_background_trends(
+            mutation, episode([1370] * 70 + [1369] * 10, 476 * NS), layouts,
+        ))
+
+    def test_climate_one_step_tolerance_applies_only_between_episodes(self) -> None:
+        signal = SignalDefinition("KL_Anf_KL", 0, 8, 1, False)
+        layouts = {0x3B5: (signal,)}
+
+        def window(value):
+            return {"b_can": [{"id": 0x3B5, "extended": False,
+                               "time_ns": index * 500_000_000,
+                               "payload": bytes([value])} for index in range(10)]}
+
+        before = window(113)
+        self.assertEqual(_compare_windows(
+            before, window(114), 0x366, layouts, "recovery",
+        )["status"], "inconclusive")
+        allowed = _compare_windows(
+            before, window(114), 0x366, layouts, "paired baseline",
+            extra_step_tolerance=PAIR_RAW_STEP_TOLERANCE,
+        )
+        self.assertEqual(allowed["status"], "stable")
+        self.assertEqual(allowed["markers"][0]["tolerated_signal_drift"][0]["after"], 114)
+        self.assertEqual(_compare_windows(
+            before, window(115), 0x366, layouts, "paired baseline",
+            extra_step_tolerance=PAIR_RAW_STEP_TOLERANCE,
+        )["status"], "inconclusive")
+
+    def test_pair_tolerances_apply_to_named_signals_and_log_excess(self) -> None:
+        cases = (
+            (0x6B8, "KBI_Tankinhalt_hochaufl", 1404, 2),
+            (0x3B5, "KL_Anf_KL", 113, 1),
+            (0x6B0, "FS_Taupunkt", 445, 4),
+            (0x6B0, "FS_Luftfeuchte_rel", 77, 2),
+            (0xA8, "MO_Mom_Begr_dyn", 665, 1),
+            (0x154, "MO_Mom_Begr_Schalt", 665, 1),
+        )
+
+        def window(can_id, value):
+            return {"b_can": [{"id": can_id, "extended": False,
+                               "time_ns": index * 500_000_000,
+                               "payload": value.to_bytes(2, "little")}
+                              for index in range(10)]}
+
+        for can_id, name, before_value, limit in cases:
+            with self.subTest(signal=name):
+                signal = SignalDefinition(name, 0, 16, 1, False)
+                layouts = {can_id: (signal,)}
+                key = "b_can", can_id, name
+                before = window(can_id, before_value)
+                within = _compare_windows(
+                    before, window(can_id, before_value - limit), 0x366,
+                    layouts, "paired baseline", extra_step_tolerance=PAIR_RAW_STEP_TOLERANCE,
+                )
+                self.assertEqual(within["status"], "stable")
+                self.assertEqual(within["markers"][0]["tolerated_signal_drift"][0]
+                                 ["tolerance_raw"], limit)
+                excess = _compare_windows(
+                    before, window(can_id, before_value - limit - 1), 0x366,
+                    layouts, "paired baseline", extra_step_tolerance=PAIR_RAW_STEP_TOLERANCE,
+                    background_trends={key: {"direction": "down"}},
+                    background_envelopes={key: {
+                        "before_values": [before_value],
+                        "after_values": [before_value - limit - 1],
+                        "max_shift_raw": limit + 1,
+                        "pre_exposure_evidence": {},
+                    }},
+                )
+                self.assertEqual(excess["status"], "inconclusive")
+                change = excess["markers"][0]["signal_changes"][0]
+                self.assertEqual(change["delta_raw"], limit + 1)
+                self.assertEqual(change["tolerance_raw"], limit)
+                self.assertIn(f"{limit + 1} raw > tolerance {limit} raw",
+                              excess["reasons"][0])
+
+        # A named signal does not make its whole CAN ID eligible for drift.
+        unrelated = SignalDefinition("OTHER", 0, 16, 1, False)
+        self.assertEqual(_compare_windows(
+            window(0x6B8, 1404), window(0x6B8, 1403), 0x366,
+            {0x6B8: (unrelated,)}, "paired baseline",
+            extra_step_tolerance=PAIR_RAW_STEP_TOLERANCE,
+        )["status"], "inconclusive")
+
+    def test_fuel_pair_tolerance_scales_with_elapsed_time_and_is_capped(self) -> None:
+        fuel = (0x6B8, "KBI_Tankinhalt_hochaufl")
+        self.assertEqual(_paired_step_tolerances(0)[fuel], 2)
+        self.assertEqual(_paired_step_tolerances(93)[fuel], 6)
+        self.assertEqual(_paired_step_tolerances(476)[fuel], 18)
+        self.assertEqual(_paired_step_tolerances(3600)[fuel], 20)
+        summary = next(row for row in _paired_tolerances_report(
+            _paired_step_tolerances(476), 476,
+        ) if row["signal"] == fuel[1])
+        self.assertEqual(summary["tolerance_physical"], 0.18)
+        self.assertEqual(summary["unit"], "L")
+        self.assertEqual(summary["elapsed_fuel_allowance"]["modeled_rate_l_per_hour"], 1.2)
+
+        signal = SignalDefinition(fuel[1], 0, 16, 1, False)
+
+        def window(value):
+            return {"b_can": [{"id": fuel[0], "extended": False,
+                               "time_ns": index * 500_000_000,
+                               "payload": value.to_bytes(2, "little")}
+                              for index in range(10)]}
+
+        before = window(1478)
+        for elapsed, after, expected in ((93, 1476, "stable"),
+                                         (476, 1465, "stable"),
+                                         (476, 1459, "inconclusive")):
+            with self.subTest(elapsed=elapsed, after=after):
+                comparison = _compare_windows(
+                    before, window(after), 0x366, {fuel[0]: (signal,)},
+                    "paired baseline", extra_step_tolerance=_paired_step_tolerances(elapsed),
+                )
+                self.assertEqual(comparison["status"], expected)
+                if expected == "inconclusive":
+                    change = comparison["markers"][0]["signal_changes"][0]
+                    self.assertEqual(change["delta_physical"], 0.19)
+                    self.assertEqual(change["tolerance_physical"], 0.18)
+
+    def test_one_raw_fuel_step_is_tolerated_but_larger_change_stops_pair(self) -> None:
+        signal = SignalDefinition("KBI_Tankinhalt_hochaufl", 0, 16, 1, False)
+
+        def window(value):
+            return [{"id": 0x6B8, "extended": False,
+                     "time_ns": index * 500_000_000,
+                     "payload": value.to_bytes(2, "little")}
+                    for index in range(10)]
+
+        before = {"b_can": window(1478)}
+        one_step = _compare_windows(
+            before, {"b_can": window(1477)}, 0x366, {0x6B8: (signal,)}, "recovery"
+        )
+        two_steps = _compare_windows(
+            before, {"b_can": window(1476)}, 0x366, {0x6B8: (signal,)}, "recovery"
+        )
+        self.assertEqual(one_step["status"], "stable")
+        self.assertEqual(one_step["markers"][0]["tolerated_signal_drift"][0]["after"], 1477)
+        self.assertEqual(two_steps["status"], "inconclusive")
+
     def test_recovery_gate_and_mutation_only_are_observational(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
