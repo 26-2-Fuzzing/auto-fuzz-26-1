@@ -30,6 +30,7 @@ CYCLE_SCHEMA_VERSION = 1
 CYCLE_FAMILIES = PROFILE_FAMILIES["all-0x366"]
 MAX_CATALOG_ENTRIES = 2000
 MAX_MUTATION_FRAMES = 20
+_UNSPECIFIED_FAMILY = object()
 
 
 def _digest(value: Any) -> str:
@@ -70,12 +71,17 @@ def _stimulus(candidate: TargetedMutation, *, duration_seconds: float,
 
 
 def _catalogue_fields(plan: Mapping[str, Any]) -> dict[str, Any]:
-    return {key: plan[key] for key in (
+    fields = {key: plan[key] for key in (
         "schema_version", "source_bus", "target_id", "baseline_payload",
         "random_seed", "dbc_path", "dbc_sha256", "undefined_max_bits",
         "mutation_duration_s", "mutation_interval_ms", "families", "entries",
         "scheduled_count", "skipped_count", "family_counts",
     )}
+    # Version 1 plans created before family selection have no such field.  Keep
+    # their catalogue fingerprint byte-for-byte stable for existing resumes.
+    if "selected_family" in plan:
+        fields["selected_family"] = plan["selected_family"]
+    return fields
 
 
 def build_cycle_plan(
@@ -87,6 +93,7 @@ def build_cycle_plan(
     undefined_max_bits: int = 2,
     mutation_duration_s: float = 1.0,
     mutation_interval_ms: float = 50.0,
+    selected_family: str | None = None,
 ) -> dict[str, Any]:
     """Freeze every distinct, sendable case of each actual 0x366 family.
 
@@ -97,6 +104,8 @@ def build_cycle_plan(
     source_bus = source_bus.lower()
     if source_bus not in {"p_can", "b_can", "i_can"}:
         raise ValueError("source_bus must be p_can, b_can, or i_can")
+    if selected_family is not None and selected_family not in CYCLE_FAMILIES:
+        raise ValueError(f"unknown cycle family: {selected_family!r}")
     original_payload = bytes(original_payload)
     if len(original_payload) != TARGET_DLC:
         raise ValueError("0x366 original payload must be exactly 8 bytes")
@@ -146,6 +155,12 @@ def build_cycle_plan(
             if fingerprint is None:
                 raise AssertionError("sendable candidate has no TX fingerprint")
             seen[fingerprint] = index
+        # Decide safety and global duplicates against the complete catalogue
+        # before filtering.  A selected family must not reclaim a stimulus
+        # already owned by an earlier family.
+        if reason is None and selected_family is not None and family != selected_family:
+            reason = "family_not_selected"
+        if reason is None:
             family_counts[family]["scheduled"] += 1
         else:
             family_counts[family]["skipped"] += 1
@@ -165,6 +180,8 @@ def build_cycle_plan(
 
     scheduled_count = sum(counts["scheduled"] for counts in family_counts.values())
     if not scheduled_count:
+        if selected_family is not None:
+            raise ValueError(f"cycle family {selected_family!r} has no safe distinct candidates")
         raise ValueError("0x366 catalogue has no safe distinct candidates")
     plan: dict[str, Any] = {
         "schema_version": CYCLE_SCHEMA_VERSION,
@@ -186,12 +203,17 @@ def build_cycle_plan(
         "completed_pairs": [],
         "status": "prepared",
     }
+    if selected_family is not None:
+        plan["selected_family"] = selected_family
     plan["catalog_sha256"] = _digest(_catalogue_fields(plan))
     validate_cycle_plan(plan)
     return plan
 
 
-def validate_cycle_plan(plan: Mapping[str, Any], *, dbc_path: str | Path | None = None) -> None:
+def validate_cycle_plan(
+    plan: Mapping[str, Any], *, dbc_path: str | Path | None = None,
+    selected_family: str | None | object = _UNSPECIFIED_FAMILY,
+) -> None:
     """Reject an altered catalogue or cursor before a resumed exposure."""
     try:
         if int(plan["schema_version"]) != CYCLE_SCHEMA_VERSION:
@@ -200,9 +222,20 @@ def validate_cycle_plan(plan: Mapping[str, Any], *, dbc_path: str | Path | None 
             raise ValueError("cycle target ID changed")
         if plan["families"] != list(CYCLE_FAMILIES):
             raise ValueError("cycle family order changed")
+        plan_family = plan.get("selected_family")
+        if ("selected_family" in plan
+                and (not isinstance(plan_family, str) or plan_family not in CYCLE_FAMILIES)):
+            raise ValueError("invalid frozen cycle family selection")
+        if selected_family is not _UNSPECIFIED_FAMILY and selected_family != plan_family:
+            raise ValueError("cycle family selection changed")
         entries = plan["entries"]
         if not isinstance(entries, list) or len(entries) > MAX_CATALOG_ENTRIES:
             raise ValueError("invalid cycle entries")
+        if plan_family is not None and any(
+            entry["disposition"] == "scheduled" and entry["family"] != plan_family
+            for entry in entries
+        ):
+            raise ValueError("cycle schedule contains a nonselected family")
         if plan["catalog_sha256"] != _digest(_catalogue_fields(plan)):
             raise ValueError("frozen cycle catalogue fingerprint mismatch")
         if any(entry["index"] != index or entry["family"] not in CYCLE_FAMILIES

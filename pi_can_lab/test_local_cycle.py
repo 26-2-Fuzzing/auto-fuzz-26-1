@@ -504,6 +504,153 @@ class LocalCycleTests(unittest.TestCase):
                           "(1 comparable, 0 inconclusive), 1 remaining",
                           output.getvalue())
 
+    def test_cycle_family_requires_paired_cycle(self):
+        args = build_parser().parse_args(["--cycle-family", "signal_single"])
+        with self.assertRaisesRegex(Exception, "requires --paired-cycle"):
+            run(args)
+
+    def test_selected_family_has_own_experiment_and_resume_rejects_a_different_family(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner, store, selector, dbc = self.make_runner(root)
+            calls = []
+
+            def completed(**kwargs):
+                calls.append((kwargs["store"].experiment_id,
+                              kwargs["cycle_entry"]["family"]))
+                return self.persist_completed_pair(**kwargs)
+
+            runner.run_paired_set = completed
+            with patch("paired_cycle.A5BlinkmodiMutator", TwoCaseGenerator):
+                first = runner.run_paired_cycle(
+                    store=store, source_bus="b_can", random_seed=366,
+                    selector=selector, dbc_path=dbc, max_sets=10,
+                    cycle_family="signal_single",
+                )
+                plan = json.loads((store.path / "pairs" / "cycle.json").read_text())
+                self.assertEqual(first["status"], "completed")
+                self.assertEqual(plan["selected_family"], "signal_single")
+                self.assertEqual(plan["scheduled_count"], 1)
+                with self.assertRaisesRegex(ValueError, "cycle family selection changed"):
+                    runner.run_paired_cycle(
+                        store=store, source_bus="b_can", random_seed=366,
+                        selector=selector, dbc_path=dbc, max_sets=1,
+                        cycle_family="signal_combination",
+                    )
+                with self.assertRaisesRegex(ValueError, "cycle family selection changed"):
+                    runner.run_paired_cycle(
+                        store=store, source_bus="b_can", random_seed=366,
+                        selector=selector, dbc_path=dbc, max_sets=1,
+                    )
+                other = ExperimentStore(root, 43, runner.config)
+                second = runner.run_paired_cycle(
+                    store=other, source_bus="b_can", random_seed=366,
+                    selector=selector, dbc_path=dbc, max_sets=10,
+                    cycle_family="signal_combination",
+                )
+            self.assertEqual(second["status"], "completed")
+            self.assertEqual(calls, [(42, "signal_single"),
+                                     (43, "signal_combination")])
+            other_plan = json.loads((other.path / "pairs" / "cycle.json").read_text())
+            self.assertEqual(other_plan["selected_family"], "signal_combination")
+
+    def test_cli_rejects_mismatched_family_before_ssh_in_preview_and_execute(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner, store, selector, dbc = self.make_runner(root)
+            runner.run_paired_set = lambda **kwargs: self.persist_completed_pair(**kwargs)
+            with patch("paired_cycle.A5BlinkmodiMutator", TwoCaseGenerator):
+                runner.run_paired_cycle(
+                    store=store, source_bus="b_can", random_seed=366,
+                    selector=selector, dbc_path=dbc, max_sets=1,
+                    cycle_family="signal_single",
+                )
+            config_path = root / "runner.yaml"
+            config_path.write_text(json.dumps(runner.config), encoding="utf-8")
+            for family_args in ([], ["--cycle-family", "signal_combination"]):
+                for mode_args in ([], ["--execute"]):
+                    with self.subTest(family_args=family_args, mode_args=mode_args):
+                        args = build_parser().parse_args([
+                            "--config", str(config_path), "--paired-cycle",
+                            "--experiment-id", "42", *family_args, *mode_args,
+                        ])
+                        with patch("experiment_runner.ExperimentRunner") as manager, \
+                             self.assertRaisesRegex(ValueError, "cycle family selection changed"):
+                            run(args)
+                        manager.assert_not_called()
+
+    def test_cli_rejects_family_on_existing_unfiltered_cycle_before_ssh(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner, store, selector, dbc = self.make_runner(root)
+            runner.run_paired_set = lambda **kwargs: self.persist_completed_pair(**kwargs)
+            with patch("paired_cycle.A5BlinkmodiMutator", TwoCaseGenerator):
+                runner.run_paired_cycle(
+                    store=store, source_bus="b_can", random_seed=366,
+                    selector=selector, dbc_path=dbc, max_sets=1,
+                )
+            config_path = root / "runner.yaml"
+            config_path.write_text(json.dumps(runner.config), encoding="utf-8")
+            for execute in (False, True):
+                args = build_parser().parse_args([
+                    "--config", str(config_path), "--paired-cycle",
+                    "--experiment-id", "42", "--cycle-family", "signal_single",
+                    *(["--execute"] if execute else []),
+                ])
+                with self.subTest(execute=execute), \
+                     patch("experiment_runner.ExperimentRunner") as manager, \
+                     self.assertRaisesRegex(ValueError, "cycle family selection changed"):
+                    run(args)
+                manager.assert_not_called()
+
+    def test_cycle_family_preview_reports_only_selected_family(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dbc = root / "A5.dbc"
+            dbc.write_text("fake DBC\n", encoding="utf-8")
+            settings = config()
+            settings["dbc"] = str(dbc)
+            settings["experiments_root"] = str(root / "experiments")
+            config_path = root / "runner.yaml"
+            config_path.write_text(json.dumps(settings), encoding="utf-8")
+            args = build_parser().parse_args([
+                "--config", str(config_path), "--paired-cycle",
+                "--cycle-family", "signal_single", "--cycle-max-sets", "10",
+            ])
+            output = io.StringIO()
+            with patch("paired_cycle.A5BlinkmodiMutator", TwoCaseGenerator), \
+                 patch("experiment_runner.ExperimentRunner") as manager, \
+                 redirect_stdout(output):
+                self.assertEqual(run(args), 0)
+            manager.assert_not_called()
+            self.assertIn("1 distinct pairs", output.getvalue())
+            self.assertIn("Family: signal_single", output.getvalue())
+            self.assertFalse((root / "experiments").exists())
+
+    def test_cycle_family_execute_records_snapshot_and_passes_selector(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dbc = root / "A5.dbc"
+            dbc.write_text("fake DBC\n", encoding="utf-8")
+            settings = config()
+            settings["dbc"] = str(dbc)
+            settings["experiments_root"] = str(root / "experiments")
+            config_path = root / "runner.yaml"
+            config_path.write_text(json.dumps(settings), encoding="utf-8")
+            args = build_parser().parse_args([
+                "--config", str(config_path), "--paired-cycle", "--execute",
+                "--experiment-id", "44", "--cycle-family", "signal_single",
+            ])
+            with patch("experiment_runner.ExperimentRunner") as manager, \
+                 redirect_stdout(io.StringIO()):
+                manager.return_value.run_paired_cycle.return_value = {"status": "completed"}
+                self.assertEqual(run(args), 0)
+            kwargs = manager.return_value.run_paired_cycle.call_args.kwargs
+            self.assertEqual(kwargs["cycle_family"], "signal_single")
+            snapshot = json.loads((root / "experiments" / "experiment_0044" /
+                                   "experiment.json").read_text())
+            self.assertEqual(snapshot["config"]["cycle_family"], "signal_single")
+
     def test_cycle_rejects_enabled_feedback_even_in_preview(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

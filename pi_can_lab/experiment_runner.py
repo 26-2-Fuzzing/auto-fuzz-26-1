@@ -28,7 +28,7 @@ from pair_analysis import (
     MAX_CLOCK_UNCERTAINTY_NS, analyze_trial_pair, recovery_returned_to_prestate,
 )
 from paired_cycle import (
-    advance_cycle, build_cycle_plan, make_cycle_mutation,
+    CYCLE_FAMILIES, advance_cycle, build_cycle_plan, make_cycle_mutation,
     next_cycle_entry, validate_cycle_plan,
 )
 from remote_capture import RemoteCapture
@@ -1142,8 +1142,9 @@ class ExperimentRunner:
         undefined_max_bits: int = 2,
         max_sets: int = 10,
         continue_inconclusive: bool = False,
+        cycle_family: str | None = None,
     ) -> dict[str, Any]:
-        """Run a bounded slice of one frozen eight-family 0x366 catalogue."""
+        """Run a bounded slice of one frozen 0x366 catalogue."""
         if max_sets < 1:
             raise ConfigurationError("cycle-max-sets must be at least 1")
         if dbc_path is None or not dbc_path.is_file():
@@ -1162,7 +1163,7 @@ class ExperimentRunner:
                       + ", ".join(map(str, reconciled_trials)))
             with cycle_path.open("r", encoding="utf-8") as handle:
                 plan = json.load(handle)
-            validate_cycle_plan(plan, dbc_path=dbc_path)
+            validate_cycle_plan(plan, dbc_path=dbc_path, selected_family=cycle_family)
             if plan.get("execution_context") != context:
                 raise RuntimeError("Frozen cycle was prepared with different runner settings")
             original = bytes.fromhex(plan["baseline_payload"])
@@ -1171,6 +1172,7 @@ class ExperimentRunner:
                 random_seed=random_seed, undefined_max_bits=undefined_max_bits,
                 mutation_duration_s=self.config["trial"]["mutation_seconds"],
                 mutation_interval_ms=self.config["trial"]["interval_ms"],
+                selected_family=cycle_family,
             )
             if rebuilt["catalog_sha256"] != plan["catalog_sha256"]:
                 raise RuntimeError("The candidate catalogue changed since cycle creation")
@@ -1188,6 +1190,7 @@ class ExperimentRunner:
                 random_seed=random_seed, undefined_max_bits=undefined_max_bits,
                 mutation_duration_s=self.config["trial"]["mutation_seconds"],
                 mutation_interval_ms=self.config["trial"]["interval_ms"],
+                selected_family=cycle_family,
             )
             plan["execution_context"] = context
             plan["cycle_id"] = "cycle_0001"
@@ -1416,6 +1419,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="resume a frozen catalogue of distinct 0x366 family pairs")
     parser.add_argument("--cycle-max-sets", type=int,
                         help="maximum newly executed pairs this invocation (default: 10)")
+    parser.add_argument("--cycle-family", choices=tuple(CYCLE_FAMILIES),
+                        help="run only this 0x366 mutation family in its own experiment")
     parser.add_argument("--continue-inconclusive", action="store_true",
                         help="record pair state/recovery uncertainty and continue the paired cycle")
     parser.add_argument("--random-seed", type=int, default=366)
@@ -1445,6 +1450,7 @@ def run(args: argparse.Namespace) -> int:
     paired_sets = getattr(args, "paired_sets", 0)
     paired_cycle = getattr(args, "paired_cycle", False)
     cycle_max_sets = getattr(args, "cycle_max_sets", None)
+    cycle_family = getattr(args, "cycle_family", None)
     continue_inconclusive = getattr(args, "continue_inconclusive", False)
     if paired_sets < 0:
         raise ConfigurationError("paired-sets cannot be negative")
@@ -1461,6 +1467,8 @@ def run(args: argparse.Namespace) -> int:
         )
     if cycle_max_sets is not None and not paired_cycle:
         raise ConfigurationError("--cycle-max-sets requires --paired-cycle")
+    if cycle_family is not None and not paired_cycle:
+        raise ConfigurationError("--cycle-family requires --paired-cycle")
     if continue_inconclusive and not paired_cycle:
         raise ConfigurationError("--continue-inconclusive requires --paired-cycle")
     cycle_max_sets = 10 if cycle_max_sets is None else cycle_max_sets
@@ -1501,6 +1509,19 @@ def run(args: argparse.Namespace) -> int:
     if paired_cycle and target_id != 0x366:
         raise ConfigurationError("--paired-cycle is dedicated to CAN ID 0x366")
     source_bus = normalize_bus(args.source_bus)
+    cycle_file = (
+        root / f"experiment_{args.experiment_id:04d}" / "pairs" / "cycle.json"
+        if paired_cycle and args.experiment_id is not None else None
+    )
+    frozen_preview_plan = None
+    if cycle_file is not None and cycle_file.is_file():
+        if dbc_path is None or not dbc_path.is_file():
+            raise ConfigurationError("Paired cycle requires an available 0x366 DBC")
+        with cycle_file.open("r", encoding="utf-8") as handle:
+            frozen_preview_plan = json.load(handle)
+        # Check the requested family before constructing SSH managers or a store.
+        validate_cycle_plan(frozen_preview_plan, dbc_path=dbc_path,
+                            selected_family=cycle_family)
     if not args.execute:
         print("[SAFE] Preview only: no SSH connection or CAN transmission was started.")
         print("[SAFE] Add --execute after reviewing experiment_runner.yaml and the isolated bench.")
@@ -1516,14 +1537,8 @@ def run(args: argparse.Namespace) -> int:
         if paired_cycle:
             if dbc_path is None or not dbc_path.is_file():
                 raise ConfigurationError("Paired cycle preview requires an available 0x366 DBC")
-            cycle_file = (
-                root / f"experiment_{args.experiment_id:04d}" / "pairs" / "cycle.json"
-                if args.experiment_id is not None else None
-            )
-            if cycle_file is not None and cycle_file.is_file():
-                with cycle_file.open("r", encoding="utf-8") as handle:
-                    preview_plan = json.load(handle)
-                validate_cycle_plan(preview_plan, dbc_path=dbc_path)
+            if frozen_preview_plan is not None:
+                preview_plan = frozen_preview_plan
                 preview_context = cycle_execution_context(
                     config, source_bus=source_bus, random_seed=args.random_seed,
                     undefined_max_bits=args.undefined_max_bits, dbc_path=dbc_path,
@@ -1551,6 +1566,7 @@ def run(args: argparse.Namespace) -> int:
                     random_seed=args.random_seed, undefined_max_bits=args.undefined_max_bits,
                     mutation_duration_s=config["trial"]["mutation_seconds"],
                     mutation_interval_ms=config["trial"]["interval_ms"],
+                    selected_family=cycle_family,
                 )
                 remaining = preview_plan["scheduled_count"]
                 phase_settings = config["trial"]
@@ -1562,6 +1578,7 @@ def run(args: argparse.Namespace) -> int:
                     f"{preview_plan['scheduled_count']} distinct pairs, "
                     f"{preview_plan['skipped_count']} skipped duplicates/unsafe cases"
                 )
+            print(f"[CYCLE] Family: {cycle_family or 'all-0x366'}")
             phase_min = sum(phase_settings[key] for key in (
                 "baseline_seconds", "normal_seconds", "mutation_seconds", "post_seconds"
             )) * 2
@@ -1577,6 +1594,7 @@ def run(args: argparse.Namespace) -> int:
         "target_id": f"0x{target_id:X}", "source_bus": source_bus.upper(),
         "random_seed": args.random_seed,
         "mutation_profile": args.mutation_profile,
+        "cycle_family": cycle_family if paired_cycle else None,
         "undefined_max_bits": args.undefined_max_bits,
         "runner_config": config,
         "trial_kind": "paired_cycle" if paired_cycle else "paired" if paired_sets
@@ -1594,6 +1612,7 @@ def run(args: argparse.Namespace) -> int:
                     selector=selector, dbc_path=dbc_path,
                     undefined_max_bits=args.undefined_max_bits, max_sets=cycle_max_sets,
                     continue_inconclusive=continue_inconclusive,
+                    cycle_family=cycle_family,
                 )
                 if result["status"] == "completed":
                     store.complete()

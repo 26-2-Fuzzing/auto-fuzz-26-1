@@ -9,6 +9,7 @@ from pathlib import Path
 
 from a5_0x366_mutator import A5BlinkmodiMutator, BASELINE_PAYLOAD, PROFILE_FAMILIES
 from paired_cycle import (
+    CYCLE_FAMILIES,
     advance_cycle,
     build_cycle_plan,
     make_cycle_mutation,
@@ -54,6 +55,102 @@ class PairedCycleTests(unittest.TestCase):
         round_trip["entries"][0]["mutated_payload"] = "FFFFFFFFFFFFFFFF"
         with self.assertRaisesRegex(ValueError, "fingerprint"):
             validate_cycle_plan(round_trip)
+
+    def test_unfiltered_selection_keeps_legacy_catalogue_and_fingerprint(self) -> None:
+        explicit_all = build_cycle_plan(
+            DBC, BASELINE_PAYLOAD, source_bus="b_can", random_seed=366,
+            selected_family=None,
+        )
+        self.assertEqual(explicit_all, self.plan)
+        self.assertNotIn("selected_family", self.plan)
+        validate_cycle_plan(self.plan, selected_family=None, dbc_path=DBC)
+
+    def test_each_selected_family_retains_global_safety_and_dedup_order(self) -> None:
+        expected_scheduled = {
+            "signal_single": 122,
+            "signal_combination": 1,
+            "state_contradiction": 8,
+            "undefined_enum": 0,
+            "undefined_bit_single": 26,
+            "undefined_bit_multi": 71,
+            "defined_undefined_mix": 42,
+            "temporal_sequence": 11,
+        }
+        self.assertEqual(set(expected_scheduled), set(CYCLE_FAMILIES))
+        for family in CYCLE_FAMILIES:
+            with self.subTest(family=family):
+                if expected_scheduled[family] == 0:
+                    with self.assertRaisesRegex(ValueError, "has no safe distinct candidates"):
+                        build_cycle_plan(
+                            DBC, BASELINE_PAYLOAD, source_bus="b_can",
+                            random_seed=366, selected_family=family,
+                        )
+                    continue
+                filtered = build_cycle_plan(
+                    DBC, BASELINE_PAYLOAD, source_bus="b_can",
+                    random_seed=366, selected_family=family,
+                )
+                self.assertEqual(filtered["selected_family"], family)
+                self.assertEqual(filtered["scheduled_count"], expected_scheduled[family])
+                self.assertNotEqual(filtered["catalog_sha256"], self.plan["catalog_sha256"])
+                self.assertEqual(len(filtered["entries"]), len(self.plan["entries"]))
+                for original, selected in zip(self.plan["entries"], filtered["entries"]):
+                    self.assertEqual(selected["index"], original["index"])
+                    self.assertEqual(selected["case"], original["case"])
+                    self.assertEqual(selected["tx_fingerprint"], original["tx_fingerprint"])
+                    self.assertEqual(selected["duplicate_of_index"], original["duplicate_of_index"])
+                    if original["disposition"] == "skipped" or original["family"] == family:
+                        self.assertEqual(selected["disposition"], original["disposition"])
+                        self.assertEqual(selected["reason"], original["reason"])
+                    else:
+                        self.assertEqual(selected["disposition"], "skipped")
+                        self.assertEqual(selected["reason"], "family_not_selected")
+                validate_cycle_plan(
+                    json.loads(json.dumps(filtered)),
+                    dbc_path=DBC, selected_family=family,
+                )
+
+    def test_filtered_late_family_cursor_completes_and_resume_rejects_other_selection(self) -> None:
+        family = "signal_combination"
+        plan = build_cycle_plan(
+            DBC, BASELINE_PAYLOAD, source_bus="b_can", random_seed=366,
+            selected_family=family,
+        )
+        entry = next_cycle_entry(plan)
+        self.assertGreater(entry["index"], 0)
+        completed = advance_cycle(plan, entry["index"], "pair_0001")
+        self.assertEqual(completed["cursor"], entry["index"] + 1)
+        self.assertEqual(completed["status"], "completed")
+        self.assertIsNone(next_cycle_entry(completed))
+        validate_cycle_plan(completed, selected_family=family, dbc_path=DBC)
+        with self.assertRaisesRegex(ValueError, "family selection changed"):
+            validate_cycle_plan(completed, selected_family=None)
+        with self.assertRaisesRegex(ValueError, "family selection changed"):
+            validate_cycle_plan(completed, selected_family="signal_single")
+
+        temporal = build_cycle_plan(
+            DBC, BASELINE_PAYLOAD, source_bus="b_can", random_seed=366,
+            selected_family="temporal_sequence",
+        )
+        first = next_cycle_entry(temporal)
+        temporal = advance_cycle(temporal, first["index"], "pair_0001")
+        second = next_cycle_entry(temporal)
+        self.assertGreater(second["index"], first["index"] + 1)
+        self.assertEqual(temporal["cursor"], first["index"] + 1)
+        validate_cycle_plan(
+            json.loads(json.dumps(temporal)), selected_family="temporal_sequence",
+        )
+
+        tampered = copy.deepcopy(plan)
+        tampered["entries"][0]["disposition"] = "scheduled"
+        with self.assertRaisesRegex(ValueError, "nonselected family"):
+            validate_cycle_plan(tampered, selected_family=family)
+
+        with self.assertRaisesRegex(ValueError, "unknown cycle family"):
+            build_cycle_plan(
+                DBC, BASELINE_PAYLOAD, source_bus="b_can", random_seed=366,
+                selected_family="all-0x366",
+            )
 
     def test_every_scheduled_stimulus_is_unique_and_skips_are_explicit(self) -> None:
         entries = self.plan["entries"]
