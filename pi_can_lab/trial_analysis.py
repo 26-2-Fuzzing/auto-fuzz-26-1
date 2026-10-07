@@ -368,18 +368,36 @@ def _mode(values: Sequence[Any]) -> Any:
     return max(counts, key=counts.get) if counts else None
 
 
-def _first_run(
+def _changed_runs(
     frames: Sequence[dict[str, Any]], values: Sequence[Any], reference: Any,
-) -> tuple[int | None, Any, int]:
-    """Find the first changed state and its initial consecutive persistence."""
-    for index, value in enumerate(values):
+    *, minimum_persistence: int, window_end_ns: int,
+) -> Iterable[tuple[int, Any, int, int]]:
+    """Keep the first change and later persistent changes starting in the window.
+
+    The first run remains diagnostic evidence even when short. Later short runs
+    and recovery-only transitions must not hide a sustained in-window change or
+    flood the report with additional observations.
+    """
+    index = 0
+    first_change = True
+    while index < len(values):
+        value = values[index]
         if value == reference or value is None:
+            index += 1
             continue
         count = 1
         while index + count < len(values) and values[index + count] == value:
             count += 1
-        return frames[index]["time_ns"], value, count
-    return None, None, 0
+        onset = frames[index]["time_ns"]
+        if first_change or (count >= minimum_persistence and onset < window_end_ns):
+            # Support belongs to this consecutive run; earlier glitches or
+            # later returns to the same value must not add test-window samples.
+            window_support = sum(
+                frame["time_ns"] < window_end_ns for frame in frames[index:index + count]
+            )
+            yield onset, value, count, window_support
+        first_change = False
+        index += count
 
 
 def _recovery_state(values: Sequence[Any], reference: Any) -> str:
@@ -458,16 +476,17 @@ def _novel_signal_strength(values: Sequence[int], changed: int, contextual: bool
     return "candidate"
 
 
-def _raw_bit_candidate(
+def _raw_bit_runs(
     pre: Sequence[dict[str, Any]], control: Sequence[dict[str, Any]],
     post: Sequence[dict[str, Any]], covered_bits: set[int],
-) -> tuple[int | None, int, int, str, list[int]]:
-    """Find a persistent change in bits stable before injection but absent from DBC signals."""
+    *, minimum_persistence: int, window_end_ns: int,
+) -> Iterable[tuple[int, int, int, int, str, list[int]]]:
+    """Find changes in bits stable before the window but absent from DBC signals."""
     if not pre or not control or not post:
-        return None, 0, 0, "unobserved", []
+        return
     size = len(control[0]["payload"])
     if any(len(item["payload"]) != size for item in (*pre, *post)):
-        return None, 0, 0, "variable_dlc", []
+        return
     full_mask = (1 << (size * 8)) - 1
     first = int.from_bytes(pre[0]["payload"], "little")
     stable_mask = full_mask
@@ -476,15 +495,16 @@ def _raw_bit_candidate(
     for bit in covered_bits:
         stable_mask &= ~(1 << bit)
     if not stable_mask:
-        return None, 0, 0, "no_stable_uncovered_bits", []
+        return
     reference = first & stable_mask
     values = [int.from_bytes(item["payload"], "little") & stable_mask for item in post]
-    onset, changed, run = _first_run(post, values, reference)
-    if onset is None:
-        return None, 0, 0, "no_stable_bit_change", []
-    xor = changed ^ reference
-    changed_bits = [bit for bit in range(size * 8) if xor & (1 << bit)]
-    return onset, xor, run, "persistent" if run >= 3 else "short", changed_bits
+    for onset, changed, run, window_support in _changed_runs(
+        post, values, reference, minimum_persistence=minimum_persistence,
+        window_end_ns=window_end_ns,
+    ):
+        xor = changed ^ reference
+        changed_bits = [bit for bit in range(size * 8) if xor & (1 << bit)]
+        yield onset, xor, run, window_support, "persistent" if run >= minimum_persistence else "short", changed_bits
 
 
 def analyze_trial(
@@ -805,59 +825,55 @@ def analyze_trial(
             if not control_values or not post_values:
                 continue
             reference = _mode(control_values)
-            onset, changed, run = _first_run(post, post_values, reference)
-            if onset is None:
-                continue
-            signal_observed = True
-            mutation_support = sum(
-                signal.decode(item["payload"]) == changed for item in mutation_all
-            )
-            classification = _novel_signal_strength(
-                pre_values, changed, _signal_is_contextual(signal.name)
-            )
-            if classification == "candidate" and (
-                run < min_persistence or onset >= mutation_end
-                or len(recovery) < min_persistence or mutation_support < 2
+            for onset, changed, run, mutation_support in _changed_runs(
+                post, post_values, reference, minimum_persistence=min_persistence,
+                window_end_ns=mutation_end,
             ):
-                classification = "inconclusive"
-            if (len(pre_values) < min_frames or len(control_values) < min_frames) and classification == "candidate":
-                classification = "inconclusive"
-            changed_payloads = sorted({
-                item["payload"].hex().upper()
-                for item, value in zip(post, post_values)
-                if value == changed and item["time_ns"] < mutation_end
-            })
-            emit(key, "PAYLOAD_CHANGE", 0.8 if classification == "candidate" else 0.0,
-                 classification, common | {
-                    "signal_name": signal.name,
-                    "reference_value": reference,
-                    "observed_value": changed,
-                    "pre_injection_values": sorted(set(pre_values)),
-                    "contextual_signal": _signal_is_contextual(signal.name),
-                    "persistence_frames": run,
-                    "mutation_support_frames": mutation_support,
-                    "recovery_state": _recovery_state(recovery_values, reference),
-                    "historically_seen_payload": any(value in historical_payloads for value in changed_payloads),
-                    "pre_injection_exact_payload": any(value in pre_payloads for value in changed_payloads),
-                    "novel_payloads": changed_payloads,
-                    "reason": (
-                        "known_pre_injection_signal_state" if classification == "background"
-                        else "contextual_signal_needs_control" if classification == "inconclusive"
-                        else "persistent_signal_transition"
-                    ),
-                }, onset_ns=onset)
+                signal_observed = True
+                classification = _novel_signal_strength(
+                    pre_values, changed, _signal_is_contextual(signal.name)
+                )
+                if classification == "candidate" and (
+                    run < min_persistence or onset >= mutation_end
+                    or len(recovery) < min_persistence or mutation_support < 2
+                ):
+                    classification = "inconclusive"
+                if (len(pre_values) < min_frames or len(control_values) < min_frames) and classification == "candidate":
+                    classification = "inconclusive"
+                changed_payloads = sorted({
+                    item["payload"].hex().upper()
+                    for item, value in zip(post, post_values)
+                    if value == changed and item["time_ns"] < mutation_end
+                })
+                emit(key, "PAYLOAD_CHANGE", 0.8 if classification == "candidate" else 0.0,
+                     classification, common | {
+                        "signal_name": signal.name,
+                        "reference_value": reference,
+                        "observed_value": changed,
+                        "pre_injection_values": sorted(set(pre_values)),
+                        "contextual_signal": _signal_is_contextual(signal.name),
+                        "persistence_frames": run,
+                        "mutation_support_frames": mutation_support,
+                        "recovery_state": _recovery_state(recovery_values, reference),
+                        "historically_seen_payload": any(value in historical_payloads for value in changed_payloads),
+                        "pre_injection_exact_payload": any(value in pre_payloads for value in changed_payloads),
+                        "novel_payloads": changed_payloads,
+                        "reason": (
+                            "known_pre_injection_signal_state" if classification == "background"
+                            else "contextual_signal_needs_control" if classification == "inconclusive"
+                            else "persistent_signal_transition"
+                        ),
+                    }, onset_ns=onset)
 
-        onset, xor, run, raw_status, changed_bits = _raw_bit_candidate(
-            pre, control, post, covered_bits
-        )
-        if onset is not None:
+        raw_observed = False
+        for onset, xor, run, mutation_support, raw_status, changed_bits in _raw_bit_runs(
+            pre, control, post, covered_bits, minimum_persistence=min_persistence,
+            window_end_ns=mutation_end,
+        ):
+            raw_observed = True
             changed_frame = next(item for item in post if item["time_ns"] == onset)
             changed_payload = changed_frame["payload"].hex().upper()
             reference_raw = int.from_bytes(control[-1]["payload"], "little") & xor
-            mutation_support = sum(
-                (int.from_bytes(item["payload"], "little") & xor) != reference_raw
-                for item in mutation_all
-            )
             classification = (
                 "candidate" if (
                     run >= min_persistence and len(pre) >= min_frames
@@ -880,7 +896,7 @@ def analyze_trial(
                     "novel_payloads": [changed_payload],
                     "reason": "persistent_stable_bit_transition" if classification == "candidate" else raw_status,
                 }, onset_ns=onset)
-        elif not signal_observed and first_post_payloads - pre_payloads:
+        if not raw_observed and not signal_observed and first_post_payloads - pre_payloads:
             emit(key, "PAYLOAD_CHANGE", 0.0, "background", common | {
                 "reason": "only_variable_or_automatic_fields_changed",
                 "pre_injection_unique_payloads": len(pre_payloads),

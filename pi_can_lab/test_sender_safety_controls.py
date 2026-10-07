@@ -13,7 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from can_common import ConfigurationError
-from can_sender import SenderInterrupted, build_parser, run
+from can_sender import SenderInterrupted, build_parser, run, transmission_schedule
 
 
 ORIGINAL = "00000000200000F0"
@@ -246,6 +246,65 @@ sender:
         self.assertEqual(end["restore"]["sent"], 1)
         self.assertEqual(len(bus.sent), 221)
         self.assertAlmostEqual(clock.now, 61.0)
+
+    def test_send_processing_time_does_not_accumulate_into_phase_cadence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.make_config(root)
+            clock = FakeClock()
+
+            class DelayedBus(FakeBus):
+                def send(self, message: SimpleNamespace, timeout: float) -> None:
+                    super().send(message, timeout)
+                    clock.now += 0.003
+
+            bus = DelayedBus()
+            args = self.args(config, "--normal-duration", "1", "--mutation-duration", "1")
+            self.assertEqual(self.run_fake(args, bus, clock), 0)
+            end = self.records(root)[-1]
+        self.assertEqual(end["status"], "completed")
+        self.assertEqual(end["phase_sent"], {"normal": 20, "mutation": 20})
+
+    def test_scheduler_never_catches_up_faster_than_configured_interval(self) -> None:
+        clock = FakeClock()
+        starts: list[float] = []
+        for _, _payload in transmission_schedule(
+            [b"\x01"], 0.05, duration_seconds=0.21,
+            clock=clock.monotonic, sleeper=clock.sleep,
+            send_start_clock=lambda: starts[-1] if starts else None,
+        ):
+            starts.append(clock.now)
+            clock.now += 0.08 if len(starts) == 1 else 0.001
+        self.assertEqual(len(starts), 4)
+        self.assertTrue(all(
+            following - previous >= 0.05 - 1e-12
+            for previous, following in zip(starts, starts[1:])
+        ))
+
+    def test_near_deadline_frame_is_skipped_before_send(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.make_config(root)
+
+            class LateWakeClock(FakeClock):
+                def sleep(self, seconds: float) -> None:
+                    mutation_wait = 0.299 < self.now < 0.301 and seconds > 0.049
+                    super().sleep(seconds)
+                    if mutation_wait:
+                        self.now += 0.047
+
+            clock = LateWakeClock()
+            bus = FakeBus()
+            self.assertEqual(self.run_fake(self.args(config), bus, clock), 0)
+            records = self.records(root)
+            end = records[-1]
+        self.assertEqual(end["status"], "completed")
+        self.assertEqual(end["phase_sent"]["mutation"], 1)
+        self.assertEqual(end["restore"]["sent"], 1)
+        skips = [record for record in records if record["record_type"] == "tx_schedule_skip"]
+        self.assertEqual(len(skips), 1)
+        self.assertEqual(skips[0]["phase"], "mutation")
+        self.assertEqual(skips[0]["phase_sequence"], 2)
 
     def test_failure_during_mutation_attempts_restore_and_logs_abort(self) -> None:
         for failure, exception in (

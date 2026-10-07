@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 from pair_analysis import (
-    PAIR_RAW_STEP_TOLERANCE, _candidate_recovery_checks, _compare_windows,
+    PAIR_RAW_STEP_TOLERANCE, _candidate_recovery_checks, _compare_windows, _tx_schedule,
     _paired_background_envelopes,
     _paired_background_trends, _paired_step_tolerances,
     _paired_tolerances_report, _within_trial_envelopes,
@@ -161,6 +161,46 @@ def _episode(root: Path, trial_id: int, kind: str, position: int, *,
 
 
 class PairAnalysisTests(unittest.TestCase):
+    def test_tx_schedule_accepts_small_steady_delay_but_rejects_loss_or_burst(self) -> None:
+        phases = _phases(100 * NS)
+        mutation = MutationCase(
+            mutation_id=1, source_bus="b_can", can_id=0x366,
+            operator="NOOP", original_payload=ORIGINAL,
+            mutated_payload=ORIGINAL, random_seed=1, trial_kind="noop",
+        )
+
+        def check(count: int, gap_ms: float, *, burst: bool = False):
+            records = [record for record in _tx(phases, "noop", ORIGINAL, 1)
+                       if not (record.get("record_type") == "can_tx"
+                               and record.get("phase") == "normal")]
+            stamps = [phases["normal_start"] + 450_000 + round(index * gap_ms * 1e6)
+                      for index in range(count)]
+            if burst:
+                stamps[100] += 30_000_000
+            for stamp in stamps:
+                records.append({
+                    "record_type": "can_tx", "phase": "normal", "status": "sent",
+                    "wall_time_ns": stamp, "arbitration_id": 0x366,
+                    "data_hex": ORIGINAL.hex().upper(), "experiment_id": 1,
+                    "trial_kind": "noop", "tx_session_id": "noop-tx", "execute": True,
+                })
+            for record in records:
+                if record.get("record_type") == "tx_session_end":
+                    record["phase_sent"]["normal"] = count
+            with tempfile.TemporaryDirectory() as directory:
+                _write_jsonl(Path(directory) / "tx.jsonl", records)
+                return _tx_schedule(Path(directory), phases, mutation, 1)
+
+        steady, errors = check(197, 50.88)
+        self.assertEqual(steady["status"], "valid")
+        self.assertEqual(errors, [])
+        missing, errors = check(180, 55.7)
+        self.assertEqual(missing["status"], "inconclusive")
+        self.assertIn("TX normal schedule is incomplete or bursty", errors)
+        bursty, errors = check(197, 50.88, burst=True)
+        self.assertEqual(bursty["status"], "inconclusive")
+        self.assertIn("TX normal schedule is incomplete or bursty", errors)
+
     def test_multimodal_timing_median_shift_does_not_fail_recovery(self) -> None:
         def timing_trial(normal_gaps, recovery_gaps):
             def frames(start, gaps):

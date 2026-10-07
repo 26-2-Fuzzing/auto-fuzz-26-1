@@ -25,6 +25,10 @@ PHASES = ("baseline", "normal", "mutation", "recovery")
 STATE_WINDOW_NS = 5_000_000_000
 MAX_CLOCK_UNCERTAINTY_NS = 100_000_000
 MIN_STATE_FRAMES = 10
+# A small, steady scheduler delay can reduce a 10 s / 50 ms phase by a few
+# frames without a skipped transmission.
+# Individual gaps, phase bounds, and the absolute frame cap are checked below.
+TX_COUNT_RELATIVE_TOLERANCE = 0.02
 # This high-resolution fuel-level estimate drifts by one 0.01 L raw step
 # during ordinary pre-exposure collection. Larger changes remain visible in
 # the recovery comparison.
@@ -274,7 +278,8 @@ def _tx_schedule(
         interval_ns = selected_interval * 1e6
         gaps = [b - a for a, b in zip(stamps, stamps[1:])]
         expected_count = duration * 1000 / selected_interval
-        if (abs(len(group) - expected_count) > 1.5
+        count_tolerance = max(1.5, TX_COUNT_RELATIVE_TOLERANCE * expected_count)
+        if (abs(len(group) - expected_count) > count_tolerance
                 or stamps[0] < phases[f"{phase}_start"]
                 or stamps[0] - phases[f"{phase}_start"] > 1.5 * interval_ns
                 or stamps[-1] > phases[f"{phase}_end"]

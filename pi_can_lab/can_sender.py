@@ -245,8 +245,9 @@ def transmission_schedule(
     clock: Callable[[], float] = time.monotonic,
     sleeper: Callable[[float], None] = time.sleep,
     deadline_monotonic: Optional[float] = None,
+    send_start_clock: Optional[Callable[[], Optional[float]]] = None,
 ) -> Iterator[Tuple[int, bytes]]:
-    """Yield one payload pass, or cycle payloads until the duration expires."""
+    """Yield payloads at a minimum interval measured from each send start."""
     if not payloads:
         return
 
@@ -255,25 +256,36 @@ def transmission_schedule(
         else clock() + duration_seconds if duration_seconds is not None else None
     )
     sequence = 0
+    previous_yield = None
     # Floating-point clock increments can otherwise add an extra frame exactly
     # at the nominal deadline (e.g. 0.1 + 4 * 0.05 versus 0.1 + 0.2).
-    while deadline is None or sequence == 0 or clock() + 1e-12 < deadline:
+    while True:
         if deadline is None and sequence >= len(payloads):
             break
+
+        if sequence and interval_seconds > 0:
+            send_start = send_start_clock() if send_start_clock is not None else None
+            anchor = send_start if send_start is not None else previous_yield
+            assert anchor is not None
+            remaining_wait = max(0.0, anchor + interval_seconds - clock())
+            if deadline is not None:
+                remaining_wait = min(remaining_wait, max(0.0, deadline - clock()))
+            if remaining_wait:
+                sleeper(remaining_wait)
+
+        if deadline is not None and sequence and clock() + 1e-12 >= deadline:
+            break
+
+        previous_yield = clock()
 
         yield sequence + 1, payloads[sequence % len(payloads)]
         sequence += 1
 
-        if deadline is None:
-            if sequence < len(payloads) and interval_seconds > 0:
-                sleeper(interval_seconds)
-            continue
-
-        remaining = deadline - clock()
-        if remaining <= 0:
+        if deadline is not None and previous_yield + interval_seconds >= deadline:
+            remaining = deadline - clock()
+            if remaining > 0:
+                sleeper(remaining)
             break
-        if interval_seconds > 0:
-            sleeper(min(interval_seconds, remaining))
 
 
 def generate_mutations(
@@ -1109,18 +1121,20 @@ def run(args: argparse.Namespace) -> int:
                 )
                 phase_attempted.setdefault(phase, 0)
                 phase_sent.setdefault(phase, 0)
+                last_send_start: Optional[float] = None
+                # Reserve at most 10ms (20% of the interval) at the boundary.
+                # This skips a late send; a send crossing the deadline still aborts.
+                send_guard_seconds = min(0.01, selected_interval_ms / 5000.0)
                 for phase_sequence, current_payload in transmission_schedule(
                     phase_payloads, selected_interval_ms / 1000.0,
                     clock=time.monotonic, sleeper=time.sleep,
                     deadline_monotonic=phase_deadline,
+                    send_start_clock=lambda: last_send_start,
                 ):
                     if phase_deadline is not None and time.monotonic() >= phase_deadline:
                         raise RuntimeError(f"{phase} phase monotonic deadline exceeded before send")
                     if phase_limit is not None and phase_attempted[phase] >= phase_limit:
                         raise RuntimeError(f"{phase} phase frame limit {phase_limit} exceeded")
-                    attempted_count += 1
-                    phase_attempted[phase] += 1
-                    attempt_ns = time.time_ns()
                     kind = "normal" if phase == "normal" else "inject"
                     if phase == "mutation" and control_noop:
                         kind = "control"
@@ -1140,6 +1154,38 @@ def run(args: argparse.Namespace) -> int:
                         message = create_message(
                             frame_id, current_payload, is_extended, is_fd, bitrate_switch
                         )
+                        remaining = (
+                            phase_deadline - time.monotonic()
+                            if phase_deadline is not None else None
+                        )
+                        if remaining is not None and remaining <= 0:
+                            raise RuntimeError(f"{phase} phase monotonic deadline exceeded before send")
+                        if remaining is not None and remaining <= send_guard_seconds:
+                            write_jsonl(handle, {
+                                "record_type": "tx_schedule_skip",
+                                "schema_version": 3,
+                                **now_fields(),
+                                "host": hostname(),
+                                "bus": bus_name,
+                                "frame_id": frame_id,
+                                "tx_session_id": tx_session_id,
+                                "experiment_id": experiment_id,
+                                "trial_kind": trial_kind,
+                                "phase": phase,
+                                "phase_sequence": phase_sequence,
+                                "interval_ms": selected_interval_ms,
+                                "execute": execute,
+                                "reason": "too_close_to_phase_deadline",
+                                "remaining_seconds": remaining,
+                                "guard_seconds": send_guard_seconds,
+                            })
+                            handle.flush()
+                            break
+                    attempted_count += 1
+                    phase_attempted[phase] += 1
+                    attempt_ns = time.time_ns()
+                    if execute:
+                        last_send_start = time.monotonic()
                         try:
                             bus.send(message, timeout=send_timeout)
                             status = "sent"
@@ -1187,6 +1233,10 @@ def run(args: argparse.Namespace) -> int:
                     )
                     if send_over_deadline:
                         raise RuntimeError(f"{phase} phase monotonic deadline exceeded during send")
+                if phase_deadline is not None:
+                    remaining = phase_deadline - time.monotonic()
+                    if remaining > 0:
+                        time.sleep(remaining)
                 phase_marker(phase, "end", marker_duration)
 
             def restore_original(*, aborting: bool = False) -> None:

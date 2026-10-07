@@ -350,7 +350,9 @@ class GuidedMutationTests(unittest.TestCase):
             )
         )
         self.assertEqual(scheduled, [(1, payloads[0]), (2, payloads[1])])
-        self.assertEqual(sleeps, [0.01])
+        self.assertEqual(len(sleeps), 1)
+        self.assertGreater(sleeps[0], 0)
+        self.assertLessEqual(sleeps[0], 0.01)
 
     def test_live_baseline_requires_configured_stability(self) -> None:
         class FakeBus:

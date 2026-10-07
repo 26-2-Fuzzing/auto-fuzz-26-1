@@ -457,16 +457,21 @@ def run(args: argparse.Namespace) -> int:
                     record["can_error"] = socketcan_error_details(
                         frame_id, bytes(message.data)
                     )
-                    can_errors.append({
-                        "wall_time": record["wall_time"],
-                        "details": record["can_error"],
-                    })
+                    if write_report:
+                        can_errors.append({
+                            "wall_time": record["wall_time"],
+                            "details": record["can_error"],
+                        })
                 else:
                     frame_key = (frame_id, bool(message.is_extended_id))
                     id_counts[frame_key] += 1
-                    id_payloads[frame_key].add(record["data_hex"])
-                    id_first_ns.setdefault(frame_key, record["wall_time_ns"])
-                    id_last_ns[frame_key] = record["wall_time_ns"]
+                    # Runner captures use --no-report. Their raw JSONL already
+                    # preserves every payload, so do not retain an unbounded
+                    # duplicate payload history in memory.
+                    if write_report:
+                        id_payloads[frame_key].add(record["data_hex"])
+                        id_first_ns.setdefault(frame_key, record["wall_time_ns"])
+                        id_last_ns[frame_key] = record["wall_time_ns"]
                     frame_type_counts[
                         "extended" if message.is_extended_id else "standard"
                     ] += 1
@@ -508,22 +513,23 @@ def run(args: argparse.Namespace) -> int:
                             }
                         else:
                             display_values = decoded_values
-                        for name, value in (display_values or {}).items():
-                            transition_key = (frame_id, name)
-                            if (
-                                transition_key in report_last_values
-                                and report_last_values[transition_key] != value
-                            ):
-                                signal_transitions.append({
-                                    "wall_time": record["wall_time"],
-                                    "can_id": record["arbitration_id_hex"],
-                                    "message": definition.name,
-                                    "signal": name,
-                                    "before": report_last_values[transition_key],
-                                    "after": value,
-                                    "data_hex": record["data_hex"],
-                                })
-                            report_last_values[transition_key] = value
+                        if write_report:
+                            for name, value in (display_values or {}).items():
+                                transition_key = (frame_id, name)
+                                if (
+                                    transition_key in report_last_values
+                                    and report_last_values[transition_key] != value
+                                ):
+                                    signal_transitions.append({
+                                        "wall_time": record["wall_time"],
+                                        "can_id": record["arbitration_id_hex"],
+                                        "message": definition.name,
+                                        "signal": name,
+                                        "before": report_last_values[transition_key],
+                                        "after": value,
+                                        "data_hex": record["data_hex"],
+                                    })
+                                report_last_values[transition_key] = value
                     except KeyError:
                         record["dbc_status"] = "unknown_id"
                     except Exception as exc:

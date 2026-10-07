@@ -476,5 +476,178 @@ class StateAwareAnalysisTests(unittest.TestCase):
                         self.assertAlmostEqual(timing["evidence"]["mutation_mean_ms"], 75)
 
 
+class LaterPersistentChangeTests(unittest.TestCase):
+    """Use inert metadata and synthetic logs to test observation sequences."""
+
+    def analyze_sequence(
+        self, values: list[int], *, dbc: bool, recovery: list[int] | None = None,
+        pre: list[int] | None = None, minimum_persistence: int = 3,
+        clocks: dict | None = None, control_count: int = 10,
+    ) -> dict:
+        phases = {
+            "baseline_start": 10 * NS, "baseline_end": 12 * NS,
+            "normal_start": 12 * NS, "normal_end": 14 * NS,
+            "mutation_start": 14 * NS, "mutation_end": 15 * NS,
+            "recovery_start": 15 * NS, "recovery_end": 17 * NS,
+        }
+        pre = [0] * 40 if pre is None else pre
+        recovery = [values[-1]] * 20 if recovery is None else recovery
+        lines = []
+        for start, samples in ((10 * NS, pre), (14 * NS, values), (15 * NS, recovery)):
+            for index, value in enumerate(samples):
+                if start == 10 * NS and 30 + control_count <= index:
+                    continue
+                lines.append(record("i_can", 0x510, f"{value:02X}",
+                                    start + 20_000_000 + index * NS // 10))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "i_can.jsonl"
+            write_frames(path, lines)
+            dbc_path = root / "toy.dbc"
+            dbc_path.write_text(
+                'BO_ 1296 ToyState: 1 Toy\n SG_ State : 0|8@1+ (1,0) [0|255] "" Toy\n',
+                encoding="ascii",
+            )
+            return analyze_trial(
+                rx_paths={"i_can": path}, phase_times_ns=phases,
+                mutation=MutationCase(
+                    mutation_id=1, source_bus="b_can", can_id=0x700,
+                    operator="OFFLINE_CALIBRATION", original_payload=b"\x00",
+                    mutated_payload=b"\x00", random_seed=1, trial_kind="noop",
+                ),
+                thresholds={"minimum_persistence_frames": minimum_persistence,
+                            "comparison_window_seconds": 1},
+                dbc_path=dbc_path if dbc else None,
+                clock_offsets=CLOCKS if clocks is None else clocks,
+                trial_kind="calibration",
+            )
+
+    @staticmethod
+    def payload_candidates(result: dict) -> list[dict]:
+        return [row for row in result["anomalies"] if row["type"] == "PAYLOAD_CHANGE"]
+
+    def test_glitch_does_not_hide_later_different_or_same_value(self) -> None:
+        for dbc in (False, True):
+            for changed in (1, 2):
+                with self.subTest(dbc=dbc, changed=changed):
+                    result = self.analyze_sequence([0, 1, 0] + [changed] * 7, dbc=dbc)
+                    candidates = self.payload_candidates(result)
+                    self.assertEqual(len(candidates), 1)
+                    evidence = candidates[0]["evidence"]
+                    self.assertEqual(evidence["onset_ms_from_mutation"], 320)
+                    self.assertEqual(evidence["persistence_frames"], 27)
+                    self.assertFalse(evidence["feedback_eligible"])
+                    self.assertFalse(evidence["verification_candidate"])
+                    if dbc:
+                        self.assertEqual(evidence["observed_value"], changed)
+                    else:
+                        self.assertEqual(evidence["changed_bits"], [changed - 1])
+                    self.assertTrue(any(
+                        row["type"] == "PAYLOAD_CHANGE"
+                        and row["classification"] == "inconclusive"
+                        and row["evidence"]["onset_ms_from_mutation"] == 120
+                        and row["evidence"]["persistence_frames"] == 1
+                        for row in result["observations"]
+                    ))
+
+    def test_multiple_persistent_runs_keep_their_own_onsets(self) -> None:
+        for dbc in (False, True):
+            for later in (1, 2):
+                with self.subTest(dbc=dbc, later=later):
+                    result = self.analyze_sequence(
+                        [0, 1, 1, 1, 0, later, later, later, 0, 0], dbc=dbc,
+                    )
+                    candidates = self.payload_candidates(result)
+                    self.assertEqual([row["evidence"]["onset_ms_from_mutation"]
+                                      for row in candidates], [120, 520])
+                    self.assertEqual([row["evidence"]["persistence_frames"]
+                                      for row in candidates], [3, 3])
+
+    def test_separated_glitches_do_not_accumulate_persistence(self) -> None:
+        for dbc in (False, True):
+            with self.subTest(dbc=dbc):
+                result = self.analyze_sequence([0, 1, 0, 1, 0, 1, 0, 1, 0, 0], dbc=dbc)
+                self.assertFalse(self.payload_candidates(result))
+
+    def test_configured_persistence_applies_to_later_runs(self) -> None:
+        for dbc in (False, True):
+            with self.subTest(dbc=dbc):
+                result = self.analyze_sequence(
+                    [0, 1, 1, 1, 0, 2, 2, 2, 2, 0], dbc=dbc, minimum_persistence=4,
+                )
+                candidates = self.payload_candidates(result)
+                self.assertEqual(len(candidates), 1)
+                self.assertEqual(candidates[0]["evidence"]["onset_ms_from_mutation"], 520)
+                self.assertEqual(candidates[0]["evidence"]["persistence_frames"], 4)
+                first = next(row for row in result["observations"] if row["type"] == "PAYLOAD_CHANGE")
+                self.assertEqual(first["classification"], "inconclusive")
+                if not dbc:
+                    self.assertEqual(first["evidence"]["reason"], "short")
+
+    def test_earlier_glitch_cannot_supply_a_later_runs_window_support(self) -> None:
+        for dbc in (False, True):
+            with self.subTest(dbc=dbc):
+                result = self.analyze_sequence([0, 1] + [0] * 7 + [1], dbc=dbc)
+                self.assertFalse(self.payload_candidates(result))
+                later = next(row for row in result["observations"]
+                             if row["type"] == "PAYLOAD_CHANGE"
+                             and row["evidence"]["onset_ms_from_mutation"] == 920)
+                self.assertEqual(later["classification"], "inconclusive")
+                self.assertEqual(later["evidence"]["mutation_support_frames"], 1)
+                self.assertEqual(later["evidence"]["persistence_frames"], 21)
+
+    def test_recovery_only_change_is_not_a_candidate(self) -> None:
+        for dbc in (False, True):
+            with self.subTest(dbc=dbc):
+                result = self.analyze_sequence([0, 1] + [0] * 8, dbc=dbc, recovery=[2] * 20)
+                self.assertFalse(self.payload_candidates(result))
+
+    def test_later_run_still_needs_control_recovery_and_valid_clock(self) -> None:
+        invalid_clocks = {**CLOCKS, "i_can": {**CLOCKS["i_can"], "alignment_valid": False}}
+        for dbc in (False, True):
+            for guard in ({"control_count": 2}, {"recovery": [2, 2]}, {"clocks": invalid_clocks}):
+                with self.subTest(dbc=dbc, guard=guard):
+                    result = self.analyze_sequence([0, 1, 0] + [2] * 7, dbc=dbc, **guard)
+                    self.assertFalse(self.payload_candidates(result))
+                    self.assertTrue(any(
+                        row["type"] == "PAYLOAD_CHANGE"
+                        and row["classification"] == "inconclusive"
+                        and row["evidence"]["onset_ms_from_mutation"] == 320
+                        for row in result["observations"]
+                    ))
+
+    def test_later_onset_uses_its_own_clock_boundary_check(self) -> None:
+        clocks = {bus: {**sample, "round_trip_ms": 200} for bus, sample in CLOCKS.items()}
+        for dbc in (False, True):
+            with self.subTest(dbc=dbc):
+                # First persistent run starts inside clock uncertainty; second is well inside the window.
+                result = self.analyze_sequence([1, 1, 1, 0] + [2] * 6, dbc=dbc, clocks=clocks)
+                candidates = self.payload_candidates(result)
+                self.assertEqual(len(candidates), 1)
+                self.assertEqual(candidates[0]["evidence"]["onset_ms_from_mutation"], 420)
+                self.assertTrue(any(
+                    row["evidence"].get("reason") == "onset_overlaps_mutation_boundary_uncertainty"
+                    for row in result["observations"]
+                ))
+                near_end = self.analyze_sequence([0, 1] + [0] * 6 + [2, 2], dbc=dbc, clocks=clocks)
+                self.assertFalse(self.payload_candidates(near_end))
+                self.assertTrue(any(
+                    row["evidence"].get("onset_ms_from_mutation") == 820
+                    and row["evidence"].get("reason") == "onset_overlaps_mutation_boundary_uncertainty"
+                    for row in near_end["observations"]
+                ))
+
+    def test_known_state_does_not_hide_later_novel_signal_state(self) -> None:
+        result = self.analyze_sequence(
+            [1, 1, 1, 0] + [4] * 6, dbc=True, pre=[1] * 10 + [0] * 30,
+        )
+        candidates = self.payload_candidates(result)
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["evidence"]["observed_value"], 4)
+        self.assertTrue(any(row["classification"] == "background"
+                            and row["evidence"].get("observed_value") == 1
+                            for row in result["observations"]))
+
+
 if __name__ == "__main__":
     unittest.main()
