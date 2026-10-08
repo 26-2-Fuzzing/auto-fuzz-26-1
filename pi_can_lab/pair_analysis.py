@@ -29,44 +29,56 @@ MIN_STATE_FRAMES = 10
 # frames without a skipped transmission.
 # Individual gaps, phase bounds, and the absolute frame cap are checked below.
 TX_COUNT_RELATIVE_TOLERANCE = 0.02
-# This high-resolution fuel-level estimate drifts by one 0.01 L raw step
-# during ordinary pre-exposure collection. Larger changes remain visible in
-# the recovery comparison.
-STATE_RAW_STEP_TOLERANCE = {"KBI_Tankinhalt_hochaufl": 1}
-# These limits cover small changes observed between the pre-exposure windows
-# of completed pairs. Keep them scoped to the DBC message and signal: another
-# signal in the same CAN message still has to match. They do not change an
-# episode's recovery gate or mutation candidate analysis.
-PAIR_RAW_STEP_TOLERANCE = {
-    (0x6B8, "KBI_Tankinhalt_hochaufl"): 2,  # 0.02 L, 0.01 L/raw
-    (0x3B5, "KL_Anf_KL"): 1,                 # 0.4 percentage points/raw
-    (0x6B0, "FS_Taupunkt"): 4,               # 0.4 °C, 0.1 °C/raw
-    (0x6B0, "FS_Luftfeuchte_rel"): 2,        # 1 percentage point, 0.5/raw
-    (0xA8, "MO_Mom_Begr_dyn"): 1,            # DBC has no physical unit
-    (0x154, "MO_Mom_Begr_Schalt"): 1,        # DBC has no physical unit
+# These are measurements of the environment or a cumulative quantity, not
+# discrete vehicle operating states. Their stable-mode differences are kept in
+# each comparison's contextual_signal_changes. The anomaly detector still
+# examines every raw frame after capture.
+STATE_CONTEXTUAL_MEASUREMENTS = {
+    (0x6B8, "KBI_Tankinhalt_hochaufl"),
+    (0x6B8, "KBI_Tankfuellstand_Prozent"),
+    (0x6B0, "FS_Taupunkt"),
+    (0x6B0, "FS_Luftfeuchte_rel"),
+    (0x484, "ND_VDOP"),
+    (0x484, "ND_HDOP"),
+    (0x484, "ND_GDOP"),
+    (0x484, "ND_PDOP"),
+    (0x485, "NP_Altitude"),
+}
+# The DBC encodes these continuous measurements with one raw step per
+# representable level. One least-significant step is not a material change of
+# operating state; a larger step remains a comparison finding. This policy is
+# applied equally before and after exposure.
+STATE_QUANTIZATION_STEPS = {
+    (0xA8, "MO_Mom_Begr_dyn"): 1,
+    (0x154, "MO_Mom_Begr_Schalt"): 1,
+    (0x640, "MO_Hoeheninfo"): 1,
 }
 PAIR_SIGNAL_PHYSICAL_SCALE = {
     (0x6B8, "KBI_Tankinhalt_hochaufl"): (0.01, "L"),
-    (0x3B5, "KL_Anf_KL"): (0.4, "percentage_points"),
+    (0x6B8, "KBI_Tankfuellstand_Prozent"): (1, "percentage_points"),
     (0x6B0, "FS_Taupunkt"): (0.1, "°C"),
     (0x6B0, "FS_Luftfeuchte_rel"): (0.5, "percentage_points"),
+    (0x484, "ND_VDOP"): (0.025, "DOP"),
+    (0x484, "ND_HDOP"): (0.025, "DOP"),
+    (0x484, "ND_GDOP"): (0.025, "DOP"),
+    (0x484, "ND_PDOP"): (0.025, "DOP"),
+    (0x485, "NP_Altitude"): (2, "m"),
 }
-FUEL_SIGNAL_KEY = (0x6B8, "KBI_Tankinhalt_hochaufl")
-# Both observed ~90 s pairs and an earlier ~8 min pause imply approximately
-# 1 L/hour of fuel use at idle. Allow 1.2 L/hour plus two raw steps for meter
-# quantization, but do not let an arbitrarily long pause hide >0.20 L.
-FUEL_PAIR_DRIFT_L_PER_HOUR = 1.2
-FUEL_PAIR_MAX_RAW_STEPS = 20
+# A5.dbc gives BCM_02 a 200 ms cycle with five 20 ms fast repetitions after
+# an event. Allow two unmatched event bursts and one window-boundary frame in
+# a five-second comparison. This is a protocol-based activity budget, not a
+# threshold inferred from previous experiment results.
+BCM02_FAST_REPETITIONS = 5
+BCM02_INCIDENTAL_BURSTS = 2
+BCM02_WINDOW_EDGE_FRAMES = 1
+BCM02_ACTIVITY_COUNT_TOLERANCE = (
+    BCM02_FAST_REPETITIONS * BCM02_INCIDENTAL_BURSTS + BCM02_WINDOW_EDGE_FRAMES
+)
 
 
-def _paired_step_tolerances(elapsed_seconds: float) -> dict[tuple[int, str], int]:
-    tolerances = dict(PAIR_RAW_STEP_TOLERANCE)
-    scale, _ = PAIR_SIGNAL_PHYSICAL_SCALE[FUEL_SIGNAL_KEY]
-    modeled_steps = math.ceil(elapsed_seconds * FUEL_PAIR_DRIFT_L_PER_HOUR / 3600 / scale)
-    tolerances[FUEL_SIGNAL_KEY] = min(
-        FUEL_PAIR_MAX_RAW_STEPS, PAIR_RAW_STEP_TOLERANCE[FUEL_SIGNAL_KEY] + modeled_steps,
-    )
-    return tolerances
+def bcm02_activity_changed(before_count: int, after_count: int) -> bool:
+    """Detect activity beyond two DBC fast bursts and one boundary frame."""
+    return abs(before_count - after_count) > BCM02_ACTIVITY_COUNT_TOLERANCE
 
 
 def _json(path: Path) -> dict[str, Any]:
@@ -624,8 +636,13 @@ def _compare_windows(
                     continue
             count_change = abs(len(lhs) - len(rhs))
             tolerance = max(8, 4 * math.sqrt(len(lhs) + len(rhs)), .5 * max(len(lhs), len(rhs)))
-            changed = (not left_periodic or not right_periodic
-                       or count_change > tolerance)
+            # A BCM_02 count difference inside the DBC fast-burst budget is
+            # incidental activity, not evidence of a sustained rate change.
+            if can_id == 0x2A0:
+                changed = bcm02_activity_changed(len(lhs), len(rhs))
+            else:
+                changed = (not left_periodic or not right_periodic
+                           or count_change > tolerance)
             if left_periodic and right_periodic:
                 bus_markers += 1
             row: dict[str, Any] = {
@@ -637,10 +654,12 @@ def _compare_windows(
             if can_id == 0x2A0:
                 row["before_hz"] = round(len(lhs) / 5, 3)
                 row["after_hz"] = round(len(rhs) / 5, 3)
+                row["incidental_burst_budget_frames"] = BCM02_ACTIVITY_COUNT_TOLERANCE
             if changed:
                 errors.append(f"{label}: {bus.upper()} 0x{can_id:X} rate/mode changed ({len(lhs)} vs {len(rhs)} frames)")
             for signal in layouts.get(can_id, ()):
-                if signal.muxed or _AUTOMATIC_FIELD.search(signal.name) or _signal_is_contextual(signal.name):
+                if (signal.muxed or _AUTOMATIC_FIELD.search(signal.name)
+                        or _signal_is_contextual(signal.name)):
                     continue
                 lvals = [value for frame in lhs if (value := signal.decode(frame["payload"])) is not None]
                 rvals = [value for frame in rhs if (value := signal.decode(frame["payload"])) is not None]
@@ -652,7 +671,7 @@ def _compare_windows(
                     signal_key = can_id, signal.name
                     pair_tolerance = (extra_step_tolerance or {}).get(signal_key)
                     tolerance = (pair_tolerance if pair_tolerance is not None
-                                 else STATE_RAW_STEP_TOLERANCE.get(signal.name, 0))
+                                 else STATE_QUANTIZATION_STEPS.get(signal_key, 0))
                     delta = abs(lmode - rmode)
                     change = {"signal": signal.name, "before": lmode, "after": rmode,
                               "delta_raw": delta, "tolerance_raw": tolerance}
@@ -662,6 +681,21 @@ def _compare_windows(
                         change.update(delta_physical=round(delta * scale, 6),
                                       tolerance_physical=round(tolerance * scale, 6),
                                       unit=unit)
+                    if signal_key in STATE_CONTEXTUAL_MEASUREMENTS:
+                        change.pop("tolerance_raw")
+                        change.pop("tolerance_physical", None)
+                        change["policy"] = "contextual_measurement"
+                        row.setdefault("contextual_signal_changes", []).append(change)
+                        continue
+                    # This DBC bit reports an exterior-light fault. A late
+                    # assertion is an observation to analyze, while the
+                    # actual lamp activity bits in the same message remain
+                    # ordinary exact state checks.
+                    if (label == "normal-to-recovery"
+                            and signal_key == (0x3D6, "LH_Aussenlicht_def")):
+                        change["policy"] = "advisory_fault_indication"
+                        row.setdefault("advisory_signal_changes", []).append(change)
+                        continue
                     trend = (background_trends or {}).get((bus, can_id, signal.name))
                     envelope = (background_envelopes or {}).get((bus, can_id, signal.name))
                     # An explicit pair limit takes precedence over a measured
@@ -804,6 +838,7 @@ def recovery_returned_to_prestate(
     trial = _load_trial(path, trial_id)
     errors = list(trial["errors"])
     state_comparison: dict[str, Any] = {}
+    observed_change = False
     if {"frames", "phases", "mutation"} <= trial.keys():
         mutation = trial["mutation"]
         layouts = _signal_layout(trial)
@@ -817,6 +852,11 @@ def recovery_returned_to_prestate(
         restored = _compare_windows(normal, recovery, mutation.can_id, layouts,
                                     "normal-to-recovery",
                                     background_envelopes=background_envelopes)
+        observed_change = any(
+            marker.get("rate_changed") or marker.get("signal_changes")
+            or marker.get("advisory_signal_changes")
+            for marker in restored["markers"]
+        )
         state_comparison = {"pre_exposure_stability": pre, "recovery": restored}
         errors.extend(pre["reasons"])
         errors.extend(restored["reasons"])
@@ -824,18 +864,22 @@ def recovery_returned_to_prestate(
         state_comparison["source_original"] = source_evidence
         if source_evidence["status"] == "inconclusive":
             errors.extend(source_evidence["reasons"])
+            observed_change |= any("payload drifted" in reason
+                                   for reason in source_evidence["reasons"])
         # Distributed sender hosts may have TX only. The next live probe must
         # independently confirm the original before a second send; the final
         # pair report will still mark the unobserved source state inconclusive.
         candidate_checks = _candidate_recovery_checks(trial)
         state_comparison["candidate_recovery_checks"] = candidate_checks
         for check in candidate_checks:
+            observed_change |= check["status"] == "changed"
             if check["status"] != "restored":
                 errors.append(
                     f"{check.get('bus', '?')} {check.get('id', '?')} {check['event_type']} "
                     f"late recovery {check['status']}: {check['reason']}"
                 )
     return {"status": "stable" if not errors else "inconclusive",
+            "observed_change": observed_change,
             "reasons": sorted(set(errors)), "state_comparison": state_comparison}
 
 
@@ -869,7 +913,7 @@ def _unverified(item: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _paired_tolerances_report(
-    tolerances: Mapping[tuple[int, str], int], elapsed_seconds: float,
+    tolerances: Mapping[tuple[int, str], int],
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for (can_id, name), tolerance in sorted(tolerances.items()):
@@ -879,13 +923,6 @@ def _paired_tolerances_report(
         if physical is not None:
             scale, unit = physical
             row.update(tolerance_physical=round(tolerance * scale, 6), unit=unit)
-        if (can_id, name) == FUEL_SIGNAL_KEY:
-            row["elapsed_fuel_allowance"] = {
-                "baseline_raw": PAIR_RAW_STEP_TOLERANCE[FUEL_SIGNAL_KEY],
-                "elapsed_seconds": round(elapsed_seconds, 3),
-                "modeled_rate_l_per_hour": FUEL_PAIR_DRIFT_L_PER_HOUR,
-                "cap_raw": FUEL_PAIR_MAX_RAW_STEPS,
-            }
         rows.append(row)
     return rows
 
@@ -980,29 +1017,32 @@ def analyze_trial_pair(
                 state_comparison[f"{role}_source_original"] = source_evidence
                 if source_evidence["status"] == "source_target_prestate_unobserved":
                     reasons.append(f"{role}: source_target_prestate_unobserved")
-        for position, gate in (("first", first_gate), ("second", second_gate)):
-            if gate["status"] != "stable":
-                # The trial's clock/capture errors are already in reasons. A
-                # generic recovery failure would misstate a quality-only gate.
-                new_reasons = [reason for reason in gate["reasons"] if reason not in reasons]
-                reasons.extend(f"{position} recovery: {reason}" for reason in new_reasons)
-                if not gate["reasons"]:
-                    reasons.append(f"{position} recovery gate is inconclusive")
+        # A first-episode failure can contaminate the second episode's
+        # control.  The second recovery happens after both exposures; a new
+        # state there is an outcome to inspect, not a reason to discard the
+        # otherwise comparable pair.
+        if first_gate["status"] != "stable":
+            new_reasons = [reason for reason in first_gate["reasons"] if reason not in reasons]
+            reasons.extend(f"first recovery: {reason}" for reason in new_reasons)
+            if not first_gate["reasons"]:
+                reasons.append("first recovery gate is inconclusive")
+        state_comparison["post_exposure_findings"] = list(second_gate["reasons"])
+        state_comparison["post_exposure_advisories"] = [
+            {"bus": marker["bus"], "id": marker["id"], **change}
+            for marker in second_gate["state_comparison"].get("recovery", {}).get("markers", [])
+            for change in marker.get("advisory_signal_changes", [])
+        ]
         if "frames" in mutation and "frames" in noop:
             layouts = _signal_layout(mutation)
             background_trends = _paired_background_trends(mutation, noop, layouts)
             background_envelopes = _paired_background_envelopes(mutation, noop, layouts)
-            pair_elapsed_seconds = abs(
-                mutation["phases"]["baseline_start"] - noop["phases"]["baseline_start"]
-            ) / 1e9
-            pair_tolerances = _paired_step_tolerances(pair_elapsed_seconds)
             state_comparison["pre_exposure_background_trends"] = [
                 {"bus": bus.upper(), "id": f"0x{can_id:X}", "signal": name,
                  "evidence": evidence}
                 for (bus, can_id, name), evidence in sorted(background_trends.items())
             ]
             state_comparison["paired_signal_tolerances"] = _paired_tolerances_report(
-                pair_tolerances, pair_elapsed_seconds,
+                STATE_QUANTIZATION_STEPS,
             )
             for phase in ("baseline", "normal"):
                 comparison = _compare_windows(
@@ -1010,7 +1050,7 @@ def analyze_trial_pair(
                     mcase.can_id, layouts, f"paired {phase}",
                     background_trends=background_trends,
                     background_envelopes=background_envelopes,
-                    extra_step_tolerance=pair_tolerances,
+                    extra_step_tolerance=STATE_QUANTIZATION_STEPS,
                 )
                 state_comparison[f"paired_{phase}"] = comparison
                 reasons.extend(comparison["reasons"])
@@ -1024,9 +1064,9 @@ def analyze_trial_pair(
         "status": "descriptive_only" if comparable else "inconclusive",
         "mutation_candidates": [_unverified(item) for item in m_candidates],
         "noop_candidates": [_unverified(item) for item in n_candidates],
-        "mutation_only": [_unverified(item) for item in m_candidates if _event_key(item) not in nkeys] if comparable else [],
-        "noop_shared": [_unverified(item) for item in m_candidates if _event_key(item) in nkeys] if comparable else [],
-        "noop_only": [_unverified(item) for item in n_candidates if _event_key(item) not in mkeys] if comparable else [],
+        "mutation_only": [_unverified(item) for item in m_candidates if _event_key(item) not in nkeys],
+        "noop_shared": [_unverified(item) for item in m_candidates if _event_key(item) in nkeys],
+        "noop_only": [_unverified(item) for item in n_candidates if _event_key(item) not in mkeys],
         "verification_status": "unverified",
         "feedback_eligible": False,
     }
@@ -1037,6 +1077,11 @@ def analyze_trial_pair(
         "noop_trial_id": noop_trial_id,
         "comparability": {"status": "comparable" if comparable else "inconclusive",
                            "reasons": sorted(set(reasons))},
+        "next_pair_gate": {
+            "status": ("ready" if state_comparison.get("second_recovery", {}).get("status") == "stable"
+                       else "review_required"),
+            "reasons": state_comparison.get("post_exposure_findings", []),
+        },
         "state_comparison": state_comparison,
         "tx_comparison": tx_comparison,
         "event_comparison": event_comparison,

@@ -24,12 +24,14 @@ from a5_0x366_mutator import A5BlinkmodiMutator, BASELINE_PAYLOAD, PROFILE_FAMIL
 from can_common import ConfigurationError, load_dbc, load_yaml_config, parse_can_data, parse_int
 from experiment_store import ExperimentStore
 from mutation_feedback import create_trial_feedback
+from minimal_recovery_gate import fault_only_advisory
 from pair_analysis import (
     MAX_CLOCK_UNCERTAINTY_NS, analyze_trial_pair, recovery_returned_to_prestate,
 )
 from paired_cycle import (
-    CYCLE_FAMILIES, advance_cycle, build_cycle_plan, make_cycle_mutation,
-    next_cycle_entry, validate_cycle_plan,
+    CYCLE_FAMILIES, advance_captured_cycle, advance_cycle, build_cycle_plan,
+    make_cycle_mutation, next_cycle_entry, validate_cycle_plan,
+    validate_deferred_cycle,
 )
 from remote_capture import RemoteCapture
 from remote_watchdog import run_supervised_sender
@@ -52,6 +54,55 @@ RECEIVER_CONFIGS = {
 }
 PHASE_NAMES = {"baseline", "normal", "mutation", "recovery"}
 PAIRED_CLOCK_SAMPLE_MULTIPLIER = 4
+
+
+def _recovery_has_observed_change(gate: Mapping[str, Any]) -> bool:
+    """Recognize real recovery changes in new and legacy gate documents."""
+    if gate.get("observed_change") is True:
+        return True
+    state = gate.get("state_comparison") or {}
+    recovery = state.get("recovery") or {}
+    if any(marker.get("rate_changed") or marker.get("signal_changes")
+           for marker in recovery.get("markers", [])):
+        return True
+    if any(check.get("status") == "changed"
+           for check in state.get("candidate_recovery_checks", [])):
+        return True
+    source = state.get("source_original") or {}
+    return any("payload drifted" in reason for reason in source.get("reasons", []))
+
+
+def _post_exposure_requires_review(report: Mapping[str, Any]) -> bool:
+    """Apply the recovery stop to new reports and saved schema-1 reports."""
+    gate = report.get("next_pair_gate")
+    if isinstance(gate, Mapping):
+        return gate.get("status") != "ready"
+    state = report.get("state_comparison") or {}
+    second = state.get("second_recovery") if isinstance(state, Mapping) else None
+    if isinstance(second, Mapping):
+        return second.get("status") != "stable"
+    return report.get("schema_version") == 1
+
+
+def _minimal_gate_ready(gate: Mapping[str, Any]) -> bool:
+    """Gate the next exposure on capture integrity, retaining state observations."""
+    status = gate.get("status")
+    reasons = gate.get("reasons")
+    advisory = gate.get("advisory_observations", [])
+    if (status not in {"stable", "review_required"}
+            or not isinstance(reasons, list)
+            or (status == "stable") != (not reasons)
+            or type(gate.get("observed_change")) is not bool
+            or not isinstance(advisory, list)
+            or (gate["observed_change"] and not reasons
+                and not fault_only_advisory(gate))):
+        return False
+    integrity_status = gate.get("capture_integrity_status")
+    if integrity_status is None:
+        # Historical deferred manifests did not split integrity and state.
+        return status == "stable" and gate["observed_change"] is False
+    return (integrity_status == "stable"
+            and gate.get("capture_integrity_reasons") == [])
 
 
 class PairedClockPreflightError(RuntimeError):
@@ -558,7 +609,10 @@ class ExperimentRunner:
         prepared_case: Optional[MutationCase] = None,
         prepared_decision: Optional[StrategyDecision] = None,
         cycle_entry: Optional[Mapping[str, Any]] = None,
+        defer_analysis: bool = False,
     ) -> dict[str, Any]:
+        if defer_analysis and cycle_entry is None:
+            raise ConfigurationError("Deferred analysis requires a frozen paired-cycle entry")
         if control_noop and (reproduce_mutation_id is not None or mutation_profile is not None):
             raise ConfigurationError("A no-op control cannot reproduce or select a mutation profile")
         if pair_id is not None:
@@ -578,6 +632,11 @@ class ExperimentRunner:
             raise RuntimeError("This experiment belongs to a paired cycle")
         if cycle_entry is not None and not cycle_path.is_file():
             raise RuntimeError("Cycle episode has no frozen cycle plan")
+        if cycle_entry is not None:
+            with cycle_path.open("r", encoding="utf-8") as handle:
+                cycle_mode = json.load(handle).get("deferred_analysis") is True
+            if cycle_mode != defer_analysis:
+                raise RuntimeError("Trial analysis mode differs from the frozen cycle")
         if pair_id is None:
             pairs_dir = store.path / "pairs"
             for path in pairs_dir.glob("pair_*.json"):
@@ -772,6 +831,10 @@ class ExperimentRunner:
             })
             store.write_json(trial_dir / "metadata.json", metadata)
 
+            if defer_analysis:
+                print(f"[CAPTURE] Trial {trial_id:04d}: TX and three receiver logs validated")
+                return {"status": "captured", "trial_id": trial_id}
+
             analysis = analyze_trial(
                 rx_paths=rx_paths,
                 phase_times_ns=phases,
@@ -838,13 +901,21 @@ class ExperimentRunner:
         scheduled_mutation: Optional[MutationCase] = None,
         cycle_entry: Optional[Mapping[str, Any]] = None,
         continue_inconclusive: bool = False,
+        defer_analysis: bool = False,
     ) -> dict[str, Any]:
         """Execute or reconcile one frozen pair without repeating an uncertain TX."""
+        if defer_analysis and cycle_entry is None:
+            raise ConfigurationError("Deferred analysis requires a frozen paired cycle")
         pairs_dir = store.path / "pairs"
         pairs_dir.mkdir(exist_ok=True)
         cycle_path = pairs_dir / "cycle.json"
         if cycle_path.is_file() != (cycle_entry is not None):
             raise RuntimeError("Cycle and standalone pairs cannot share one experiment")
+        if cycle_path.is_file():
+            with cycle_path.open("r", encoding="utf-8") as handle:
+                cycle_mode = json.load(handle).get("deferred_analysis") is True
+            if cycle_mode != defer_analysis:
+                raise RuntimeError("Pair analysis mode differs from the frozen cycle")
         if (scheduled_mutation is None) != (cycle_entry is None):
             raise ConfigurationError("A scheduled mutation needs a cycle entry")
         indexed_paths = sorted(
@@ -856,11 +927,12 @@ class ExperimentRunner:
         for _, path in indexed_paths:
             with path.open("r", encoding="utf-8") as handle:
                 document = json.load(handle)
-            if document.get("status") != "completed":
+            finished = ({"captured", "completed"} if defer_analysis else {"completed"})
+            if document.get("status") not in finished:
                 pending.append((path, document))
         if len(pending) > 1:
             raise RuntimeError("Multiple unfinished pairs need manual inspection")
-        if not pending and indexed_paths:
+        if not defer_analysis and not pending and indexed_paths:
             latest_path = indexed_paths[-1][1]
             with latest_path.open("r", encoding="utf-8") as handle:
                 latest = json.load(handle)
@@ -876,6 +948,8 @@ class ExperimentRunner:
                 raise RuntimeError("Latest pair comparison record is inconsistent")
             if comparability != "comparable" and not continue_inconclusive:
                 raise RuntimeError("Latest pair comparison is inconclusive; campaign is paused")
+            if _post_exposure_requires_review(latest_report):
+                raise RuntimeError("Latest pair recovery requires review; campaign is paused")
 
         if pending:
             pair_path, pair = pending[0]
@@ -891,8 +965,10 @@ class ExperimentRunner:
                 "collection_config": dict(self.config["trial"]),
                 "analysis_config": dict(self.config.get("anomaly_thresholds", {})),
                 "dbc_path": str(dbc_path) if dbc_path else None,
+                "analysis_mode": "deferred" if defer_analysis else "immediate",
             }
-            if any(pair.get(key) != value for key, value in expected.items()):
+            if any(pair.get(key, "immediate" if key == "analysis_mode" else None) != value
+                   for key, value in expected.items()):
                 raise RuntimeError(f"{pair_id} was prepared with different settings")
         else:
             pair_index = indexed_paths[-1][0] + 1 if indexed_paths else 1
@@ -940,6 +1016,7 @@ class ExperimentRunner:
                 "collection_config": dict(self.config["trial"]),
                 "analysis_config": dict(self.config.get("anomaly_thresholds", {})),
                 "dbc_path": str(dbc_path) if dbc_path else None,
+                "analysis_mode": "deferred" if defer_analysis else "immediate",
                 "baseline_payload": original.hex().upper(),
                 "frozen_mutation": mutation.to_dict(),
                 "frozen_noop": control.to_dict(),
@@ -991,11 +1068,14 @@ class ExperimentRunner:
                     metadata = json.load(handle)
                 with (trial_dir / "mutation.json").open("r", encoding="utf-8") as handle:
                     recorded = MutationCase.from_dict(json.load(handle))
-                files = ("feedback.json", "anomalies.json", "tx.jsonl",
-                         "p_can.jsonl", "b_can.jsonl", "i_can.jsonl")
+                files = (("tx.jsonl", "p_can.jsonl", "b_can.jsonl", "i_can.jsonl")
+                         if defer_analysis else
+                         ("feedback.json", "anomalies.json", "tx.jsonl",
+                          "p_can.jsonl", "b_can.jsonl", "i_can.jsonl"))
                 if not all((trial_dir / file).is_file() for file in files):
                     raise RuntimeError("completed episode lacks required evidence files")
-                if (metadata.get("status") != "completed" or metadata.get("pair_id") != pair_id
+                if (metadata.get("status") != ("captured" if defer_analysis else "completed")
+                        or metadata.get("pair_id") != pair_id
                         or metadata.get("pair_position") != position
                         or metadata.get("pair_order") != pair["pair_order"]
                         or metadata.get("pair_role") != kind
@@ -1003,13 +1083,14 @@ class ExperimentRunner:
                         or recorded.trial_kind != kind or recorded.original_payload != original
                         or recorded != (mutation if kind == "mutation" else control)):
                     raise RuntimeError("existing episode does not match the frozen pair plan")
-                state = store.load_feedback_state()
-                ledger = (
-                    state.get("control_trial_ids", []) if kind == "noop"
-                    else state.get("completed_trial_ids", [])
-                )
-                if trial_id not in {int(value) for value in ledger}:
-                    raise RuntimeError("episode completion is absent from the feedback ledger")
+                if not defer_analysis:
+                    state = store.load_feedback_state()
+                    ledger = (
+                        state.get("control_trial_ids", []) if kind == "noop"
+                        else state.get("completed_trial_ids", [])
+                    )
+                    if trial_id not in {int(value) for value in ledger}:
+                        raise RuntimeError("episode completion is absent from the feedback ledger")
             except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
                 raise RuntimeError(f"Trial {trial_id} exists but cannot be safely resumed") from exc
             return True
@@ -1019,12 +1100,13 @@ class ExperimentRunner:
         ), start=1):
             if completed_episode(position, kind, trial_id):
                 if position == 1 and pair["status"] == "prepared":
-                    save_pair("first_completed")
+                    save_pair("first_captured" if defer_analysis else "first_completed")
                 continue
             if (position == 1 and pair["status"] in {
-                    "first_completed", "analysis_pending", "completed"
+                    "first_completed", "analysis_pending", "completed",
+                    "first_captured", "capture_pending", "captured",
                 }) or (position == 2 and pair["status"] in {
-                    "analysis_pending", "completed"
+                    "analysis_pending", "completed", "capture_pending", "captured",
                 }):
                 raise RuntimeError(
                     f"{pair_id} is missing a previously completed trial; refusing reinjection"
@@ -1034,9 +1116,11 @@ class ExperimentRunner:
             # automatic injection attempt.
             resume_after_completed_first = (
                 position == 2 and pair["status"] == "blocked"
+                and not defer_analysis
                 and ("recovery_gate" not in pair or (
                     continue_inconclusive
                     and (pair.get("recovery_gate") or {}).get("status") == "inconclusive"
+                    and not _recovery_has_observed_change(pair.get("recovery_gate") or {})
                     and "interruption" not in pair
                 ))
             )
@@ -1044,29 +1128,44 @@ class ExperimentRunner:
                 raise RuntimeError(f"{pair_id} is blocked; incomplete trials are never reinjected")
             if position == 2:
                 try:
-                    gate = recovery_returned_to_prestate(store.path, first_trial_id)
+                    if defer_analysis:
+                        from minimal_recovery_gate import check_minimal_recovery
+                        gate = check_minimal_recovery(store.path / f"trial_{first_trial_id:04d}")
+                    else:
+                        gate = recovery_returned_to_prestate(store.path, first_trial_id)
                 except BaseException as exc:
                     save_pair("blocked", recovery_gate={
                         "status": "inconclusive", "reasons": [f"{type(exc).__name__}: {exc}"],
                     })
                     raise
-                save_pair("first_completed", recovery_gate=gate)
-                if gate.get("status") != "stable":
-                    if gate.get("status") != "inconclusive":
+                if defer_analysis:
+                    gates = dict(pair.get("recovery_gates") or {})
+                    gates["first"] = gate
+                    save_pair("first_captured", recovery_gates=gates)
+                    if not _minimal_gate_ready(gate):
                         save_pair("blocked")
-                        raise RuntimeError(f"{pair_id} first recovery gate returned an invalid status")
-                    if not continue_inconclusive:
-                        save_pair("blocked")
-                        raise RuntimeError(f"{pair_id} first recovery did not pass the prestate gate")
-                    advisory = {
-                        "stage": "first_recovery", "status": "inconclusive",
-                        "reasons": gate.get("reasons", []), "recorded_at": utc_now(),
-                    }
-                    save_pair("first_completed", advisories=[
-                        *[item for item in pair.get("advisories", [])
-                          if item.get("stage") != "first_recovery"], advisory,
-                    ])
-                    print(f"[WARN] {pair_id} first recovery inconclusive; recorded and continuing")
+                        raise RuntimeError(f"{pair_id} first recovery needs review; campaign is paused")
+                else:
+                    save_pair("first_completed", recovery_gate=gate)
+                    if gate.get("status") != "stable":
+                        if gate.get("status") != "inconclusive":
+                            save_pair("blocked")
+                            raise RuntimeError(f"{pair_id} first recovery gate returned an invalid status")
+                        if _recovery_has_observed_change(gate):
+                            save_pair("blocked")
+                            raise RuntimeError(f"{pair_id} first recovery has an observed change; campaign is paused")
+                        if not continue_inconclusive:
+                            save_pair("blocked")
+                            raise RuntimeError(f"{pair_id} first recovery did not pass the prestate gate")
+                        advisory = {
+                            "stage": "first_recovery", "status": "inconclusive",
+                            "reasons": gate.get("reasons", []), "recorded_at": utc_now(),
+                        }
+                        save_pair("first_completed", advisories=[
+                            *[item for item in pair.get("advisories", [])
+                              if item.get("stage") != "first_recovery"], advisory,
+                        ])
+                        print(f"[WARN] {pair_id} first recovery inconclusive; recorded and continuing")
             case = control if kind == "noop" else mutation
             episode_decision = (
                 StrategyDecision("CONTROL", "NOOP", None, None, case.generation_reason)
@@ -1081,13 +1180,15 @@ class ExperimentRunner:
                     expected_trial_id=trial_id, expected_original_payload=original,
                     prepared_case=case, prepared_decision=episode_decision,
                     cycle_entry=pair.get("cycle_entry"),
+                    defer_analysis=defer_analysis,
                 )
             except PairedClockPreflightError as exc:
                 if (store.path / f"trial_{trial_id:04d}").exists():
                     save_pair("blocked", interruption=f"{type(exc).__name__}: {exc}")
                 else:
                     save_pair(
-                        "prepared" if position == 1 else "first_completed",
+                        "prepared" if position == 1 else
+                        ("first_captured" if defer_analysis else "first_completed"),
                         last_clock_preflight_failure={
                             "trial_id": trial_id, "error": str(exc), "at": utc_now(),
                         },
@@ -1096,7 +1197,29 @@ class ExperimentRunner:
             except BaseException as exc:
                 save_pair("blocked", interruption=f"{type(exc).__name__}: {exc}")
                 raise
-            save_pair("first_completed" if position == 1 else "analysis_pending")
+            save_pair(("first_captured" if position == 1 else "capture_pending")
+                      if defer_analysis else
+                      ("first_completed" if position == 1 else "analysis_pending"))
+
+        if defer_analysis:
+            from minimal_recovery_gate import check_minimal_recovery
+            try:
+                second_gate = check_minimal_recovery(
+                    store.path / f"trial_{second_trial_id:04d}"
+                )
+            except Exception as exc:
+                second_gate = {
+                    "status": "review_required", "observed_change": False,
+                    "reasons": [f"Recovery check failed: {type(exc).__name__}: {exc}"],
+                }
+            gates = dict(pair.get("recovery_gates") or {})
+            gates["second"] = second_gate
+            save_pair("captured", recovery_gates=gates)
+            pause_required = not _minimal_gate_ready(second_gate)
+            print(f"[PAIR] {pair_id}: both episodes captured; analysis pending"
+                  + ("; recovery needs review" if pause_required else ""))
+            return {"status": "captured", "pair_id": pair_id,
+                    "recovery_gates": gates, "pause_required": pause_required}
 
         mutation_trial_id = (
             first_trial_id if pair["pair_order"][0] == "mutation" else second_trial_id
@@ -1126,9 +1249,237 @@ class ExperimentRunner:
               f"comparison={comparability}")
         if comparability != "comparable" and not continue_inconclusive:
             raise RuntimeError(f"{pair_id} comparison is inconclusive; campaign is paused")
+        if _post_exposure_requires_review(report):
+            raise RuntimeError(f"{pair_id} recovery requires review; campaign is paused")
         if comparability == "inconclusive":
             print(f"[WARN] {pair_id} comparison inconclusive; recorded and continuing")
         return report
+
+    @_with_trial_lock
+    def run_deferred_paired_cycle(
+        self,
+        *,
+        store: ExperimentStore,
+        source_bus: str,
+        random_seed: int,
+        selector: TrialStrategySelector,
+        dbc_path: Path,
+        undefined_max_bits: int = 2,
+        max_sets: int = 10,
+        cycle_family: str | None = None,
+    ) -> dict[str, Any]:
+        """Collect a frozen cycle; leave detailed analysis for offline finalization."""
+        if max_sets < 1:
+            raise ConfigurationError("cycle-max-sets must be at least 1")
+        if dbc_path is None or not dbc_path.is_file():
+            raise ConfigurationError("Paired cycle requires an available 0x366 DBC")
+        pairs_dir = store.path / "pairs"
+        pairs_dir.mkdir(exist_ok=True)
+        cycle_path = pairs_dir / "cycle.json"
+        context = cycle_execution_context(
+            self.config, source_bus=source_bus, random_seed=random_seed,
+            undefined_max_bits=undefined_max_bits, dbc_path=dbc_path,
+        )
+        if cycle_path.is_file():
+            with cycle_path.open("r", encoding="utf-8") as handle:
+                plan = json.load(handle)
+            validate_deferred_cycle(plan, dbc_path=dbc_path,
+                                    selected_family=cycle_family)
+            if plan.get("execution_context") != context:
+                raise RuntimeError("Frozen cycle was prepared with different runner settings")
+            original = bytes.fromhex(plan["baseline_payload"])
+            rebuilt = build_cycle_plan(
+                dbc_path, original, source_bus=source_bus,
+                random_seed=random_seed, undefined_max_bits=undefined_max_bits,
+                mutation_duration_s=self.config["trial"]["mutation_seconds"],
+                mutation_interval_ms=self.config["trial"]["interval_ms"],
+                selected_family=cycle_family,
+            )
+            if rebuilt["catalog_sha256"] != plan["catalog_sha256"]:
+                raise RuntimeError("The candidate catalogue changed since cycle creation")
+        else:
+            if any(store.path.glob("trial_*")) or any(
+                re.fullmatch(r"pair_\d+\.json", path.name)
+                for path in pairs_dir.iterdir() if path.is_file()
+            ):
+                raise RuntimeError("A new deferred cycle needs an empty experiment")
+            original = self.probe_payload(source_bus, 0x366, require_live=True)
+            plan = build_cycle_plan(
+                dbc_path, original, source_bus=source_bus,
+                random_seed=random_seed, undefined_max_bits=undefined_max_bits,
+                mutation_duration_s=self.config["trial"]["mutation_seconds"],
+                mutation_interval_ms=self.config["trial"]["interval_ms"],
+                selected_family=cycle_family,
+            )
+            plan.update({
+                "execution_context": context,
+                "cycle_id": "cycle_0001",
+                "created_at": utc_now(),
+                "deferred_analysis": True,
+                "captured_pairs": [],
+            })
+            validate_deferred_cycle(plan, dbc_path=dbc_path,
+                                    selected_family=cycle_family)
+            store.write_json(cycle_path, plan)
+
+        scheduled = [entry for entry in plan["entries"]
+                     if entry["disposition"] == "scheduled"]
+
+        def cycle_link(entry: Mapping[str, Any]) -> dict[str, Any]:
+            return {
+                "catalog_sha256": plan["catalog_sha256"],
+                "entry_index": entry["index"],
+                "entry_id": entry["entry_id"],
+                "family": entry["family"],
+                "case": entry["case"],
+                "tx_fingerprint": entry["tx_fingerprint"],
+            }
+
+        def find_pair(link: Mapping[str, Any]) -> tuple[Path, dict[str, Any]] | None:
+            matches = []
+            for path in pairs_dir.iterdir():
+                if not path.is_file() or not re.fullmatch(r"pair_\d+\.json", path.name):
+                    continue
+                with path.open("r", encoding="utf-8") as handle:
+                    pair = json.load(handle)
+                recorded = pair.get("cycle_entry")
+                if not isinstance(recorded, Mapping):
+                    raise RuntimeError(f"{path.name} is not linked to the frozen cycle")
+                if recorded.get("catalog_sha256") != plan["catalog_sha256"]:
+                    raise RuntimeError(f"{path.name} belongs to another catalogue")
+                if recorded.get("entry_index") == link["entry_index"]:
+                    if recorded != link:
+                        raise RuntimeError(f"{path.name} conflicts with the cycle entry")
+                    matches.append((path, pair))
+            if len(matches) > 1:
+                raise RuntimeError("Two pairs claim the same cycle entry")
+            return matches[0] if matches else None
+
+        def audit_captured(entry: Mapping[str, Any], pair_path: Path,
+                           pair: Mapping[str, Any]) -> None:
+            pair_id = pair_path.stem
+            link = cycle_link(entry)
+            analyzed = pair.get("status") == "completed"
+            if (pair.get("status") not in {"captured", "completed"}
+                    or pair.get("analysis_mode") != "deferred"
+                    or pair.get("pair_id") != pair_id
+                    or pair.get("cycle_entry") != link):
+                raise RuntimeError(f"{pair_id} capture manifest is inconsistent")
+            if analyzed:
+                report_name = pair.get("pair_report")
+                if (not isinstance(report_name, str)
+                        or Path(report_name).name != report_name
+                        or not (pairs_dir / report_name).is_file()):
+                    raise RuntimeError(f"{pair_id} analyzed report is missing")
+                with (pairs_dir / report_name).open("r", encoding="utf-8") as handle:
+                    report = json.load(handle)
+                if (report.get("pair_id") != pair_id
+                        or (report.get("comparability") or {}).get("status")
+                        != pair.get("comparability_status")):
+                    raise RuntimeError(f"{pair_id} analyzed report conflicts with manifest")
+                # Saved analytical observations do not control capture progress.
+            gates = pair.get("recovery_gates") or {}
+            first_gate = gates.get("first") or {}
+            second_gate = gates.get("second") or {}
+            if (not _minimal_gate_ready(first_gate)
+                    or second_gate.get("status") not in {"stable", "review_required"}
+                    or type(second_gate.get("observed_change")) is not bool
+                    or not isinstance(second_gate.get("reasons"), list)):
+                raise RuntimeError(f"{pair_id} recovery gate is invalid")
+            first_id = int(pair.get("first_trial_id", -1))
+            second_id = int(pair.get("second_trial_id", -1))
+            order = pair.get("pair_order")
+            if (first_id < 1 or second_id != first_id + 1
+                    or order not in (["noop", "mutation"], ["mutation", "noop"])):
+                raise RuntimeError(f"{pair_id} has invalid frozen trial IDs or order")
+            mutation = MutationCase.from_dict(pair["frozen_mutation"])
+            expected = make_cycle_mutation(
+                entry, mutation_id=mutation.mutation_id,
+                source_bus=source_bus, original_payload=original,
+                random_seed=random_seed,
+            )
+            if (mutation.source_bus != expected.source_bus
+                    or mutation.can_id != expected.can_id
+                    or mutation.original_payload != expected.original_payload
+                    or mutation.mutated_payload != expected.mutated_payload
+                    or mutation.operator != expected.operator
+                    or mutation.parameters != expected.parameters):
+                raise RuntimeError(f"{pair_id} mutation differs from the scheduled case")
+            control = MutationCase.from_dict(pair["frozen_noop"])
+            for position, trial_id in enumerate((first_id, second_id), start=1):
+                trial_dir = store.path / f"trial_{trial_id:04d}"
+                if not all((trial_dir / name).is_file() for name in (
+                    "metadata.json", "mutation.json", "tx.jsonl",
+                    "p_can.jsonl", "b_can.jsonl", "i_can.jsonl",
+                )):
+                    raise RuntimeError(f"{pair_id} trial {trial_id} lacks capture evidence")
+                with (trial_dir / "metadata.json").open("r", encoding="utf-8") as handle:
+                    metadata = json.load(handle)
+                with (trial_dir / "mutation.json").open("r", encoding="utf-8") as handle:
+                    recorded = MutationCase.from_dict(json.load(handle))
+                if (metadata.get("status") != ("completed" if analyzed else "captured")
+                        or metadata.get("pair_id") != pair_id
+                        or metadata.get("pair_position") != position
+                        or metadata.get("pair_order") != order
+                        or metadata.get("cycle_entry") != link
+                        or recorded != (mutation if order[position - 1] == "mutation" else control)):
+                    raise RuntimeError(f"{pair_id} trial {trial_id} conflicts with its plan")
+
+        for index, recorded in enumerate(plan["captured_pairs"]):
+            entry = scheduled[index]
+            pair = find_pair(cycle_link(entry))
+            if pair is None or pair[0].stem != recorded["pair_id"]:
+                raise RuntimeError("Capture ledger has no matching pair manifest")
+            audit_captured(entry, *pair)
+            if not _minimal_gate_ready((pair[1].get("recovery_gates") or {}).get("second") or {}):
+                raise RuntimeError(f"{pair[0].stem} recovery needs review; campaign is paused")
+
+        newly_executed = 0
+        reconciled = 0
+        while newly_executed < max_sets and len(plan["captured_pairs"]) < len(scheduled):
+            entry = scheduled[len(plan["captured_pairs"])]
+            link = cycle_link(entry)
+            existing = find_pair(link)
+            if existing is None or existing[1].get("status") not in {"captured", "completed"}:
+                if (existing is None and store.next_trial_id()
+                        != 2 * len(plan["captured_pairs"]) + 1):
+                    raise RuntimeError("Cycle trial evidence exists without a linked pair manifest")
+                mutation = make_cycle_mutation(
+                    entry, mutation_id=store.next_mutation_id(),
+                    source_bus=source_bus, original_payload=original,
+                    random_seed=random_seed,
+                )
+                self.run_paired_set(
+                    store=store, source_bus=source_bus, can_id=0x366,
+                    random_seed=random_seed, selector=selector, dbc_path=dbc_path,
+                    undefined_max_bits=undefined_max_bits,
+                    scheduled_mutation=mutation, cycle_entry=link,
+                    defer_analysis=True,
+                )
+                newly_executed += 1
+                existing = find_pair(link)
+                if existing is None:
+                    raise RuntimeError("Captured pair has no manifest")
+            else:
+                reconciled += 1
+            audit_captured(entry, *existing)
+            plan = advance_captured_cycle(plan, entry["index"], existing[0].stem)
+            plan["updated_at"] = utc_now()
+            store.write_json(cycle_path, plan)
+            if not _minimal_gate_ready((existing[1].get("recovery_gates") or {}).get("second") or {}):
+                raise RuntimeError(f"{existing[0].stem} recovery needs review; campaign is paused")
+        remaining = len(scheduled) - len(plan["captured_pairs"])
+        print(f"[CYCLE] {len(plan['captured_pairs'])}/{len(scheduled)} pairs captured; "
+              f"{remaining} remaining; detailed analysis pending")
+        return {
+            "status": "capture_complete" if remaining == 0 else "capture_active",
+            "scheduled_count": len(scheduled),
+            "captured_count": len(plan["captured_pairs"]),
+            "remaining_count": remaining,
+            "executed_this_invocation": newly_executed,
+            "reconciled_this_invocation": reconciled,
+            "cycle_manifest": str(cycle_path),
+        }
 
     @_with_trial_lock
     def run_paired_cycle(
@@ -1163,6 +1514,8 @@ class ExperimentRunner:
                       + ", ".join(map(str, reconciled_trials)))
             with cycle_path.open("r", encoding="utf-8") as handle:
                 plan = json.load(handle)
+            if plan.get("deferred_analysis") is True:
+                raise RuntimeError("Deferred cycle must use capture-only execution and offline finalization")
             validate_cycle_plan(plan, dbc_path=dbc_path, selected_family=cycle_family)
             if plan.get("execution_context") != context:
                 raise RuntimeError("Frozen cycle was prepared with different runner settings")
@@ -1245,6 +1598,8 @@ class ExperimentRunner:
                 raise RuntimeError(f"{path.stem} report and manifest comparison disagree")
             if comparability == "inconclusive" and not continue_inconclusive:
                 raise RuntimeError(f"{path.stem} is inconclusive; cycle remains paused")
+            if _post_exposure_requires_review(report):
+                raise RuntimeError(f"{path.stem} recovery requires review; cycle remains paused")
             if comparability == "inconclusive":
                 tx = report.get("tx_comparison") or {}
                 if any((tx.get(role) or {}).get("status") != "valid"
@@ -1416,7 +1771,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--paired-sets", type=int, default=0,
                         help="run two full no-op/mutation episodes per set, with balanced order")
     parser.add_argument("--paired-cycle", action="store_true",
-                        help="resume a frozen catalogue of distinct 0x366 family pairs")
+                        help="capture a frozen catalogue of distinct 0x366 family pairs; new cycles defer analysis")
+    parser.add_argument("--finalize-analysis", action="store_true",
+                        help="analyze a captured deferred cycle offline after collection")
     parser.add_argument("--cycle-max-sets", type=int,
                         help="maximum newly executed pairs this invocation (default: 10)")
     parser.add_argument("--cycle-family", choices=tuple(CYCLE_FAMILIES),
@@ -1452,6 +1809,16 @@ def run(args: argparse.Namespace) -> int:
     cycle_max_sets = getattr(args, "cycle_max_sets", None)
     cycle_family = getattr(args, "cycle_family", None)
     continue_inconclusive = getattr(args, "continue_inconclusive", False)
+    finalize_analysis = getattr(args, "finalize_analysis", False)
+    if finalize_analysis:
+        if args.experiment_id is None:
+            raise ConfigurationError("--finalize-analysis requires --experiment-id")
+        if (args.execute or paired_cycle or paired_sets or explicit_trials is not None
+                or args.control_noop or args.reproduce_mutation_id is not None
+                or args.mutation_profile is not None or args.print_0x366_map
+                or cycle_max_sets is not None or cycle_family is not None
+                or continue_inconclusive):
+            raise ConfigurationError("--finalize-analysis is a separate offline operation")
     if paired_sets < 0:
         raise ConfigurationError("paired-sets cannot be negative")
     if paired_sets and (explicit_trials is not None or args.control_noop
@@ -1489,6 +1856,17 @@ def run(args: argparse.Namespace) -> int:
         root = config_path.parent / root
     root = root.resolve()
     experiment_id = args.experiment_id or next_experiment_id(root)
+    if finalize_analysis:
+        experiment_path = root / f"experiment_{experiment_id:04d}"
+        if not all((experiment_path / name).is_file() for name in (
+            "experiment.json", "feedback_state.json", "pairs/cycle.json",
+        )):
+            raise ConfigurationError("Deferred experiment evidence is missing")
+        from deferred_finalizer import finalize_deferred_cycle
+        store = ExperimentStore(root, experiment_id, {})
+        result = finalize_deferred_cycle(store)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
     dbc_value = config.get("dbc", "../A5.dbc")
     dbc_path = Path(dbc_value).expanduser() if dbc_value else None
     if dbc_path is not None and not dbc_path.is_absolute() and config_path is not None:
@@ -1520,8 +1898,18 @@ def run(args: argparse.Namespace) -> int:
         with cycle_file.open("r", encoding="utf-8") as handle:
             frozen_preview_plan = json.load(handle)
         # Check the requested family before constructing SSH managers or a store.
-        validate_cycle_plan(frozen_preview_plan, dbc_path=dbc_path,
-                            selected_family=cycle_family)
+        if frozen_preview_plan.get("deferred_analysis") is True:
+            validate_deferred_cycle(frozen_preview_plan, dbc_path=dbc_path,
+                                    selected_family=cycle_family)
+        else:
+            validate_cycle_plan(frozen_preview_plan, dbc_path=dbc_path,
+                                selected_family=cycle_family)
+    if paired_cycle and continue_inconclusive and (
+        frozen_preview_plan is None or frozen_preview_plan.get("deferred_analysis") is True
+    ):
+        raise ConfigurationError(
+            "--continue-inconclusive is unavailable for capture-only cycles"
+        )
     if not args.execute:
         print("[SAFE] Preview only: no SSH connection or CAN transmission was started.")
         print("[SAFE] Add --execute after reviewing experiment_runner.yaml and the isolated bench.")
@@ -1545,7 +1933,9 @@ def run(args: argparse.Namespace) -> int:
                 )
                 if preview_plan.get("execution_context") != preview_context:
                     raise RuntimeError("Frozen cycle was prepared with different runner settings")
-                completed = len(preview_plan["completed_pairs"])
+                deferred = preview_plan.get("deferred_analysis") is True
+                completed = len(preview_plan["captured_pairs"] if deferred
+                                else preview_plan["completed_pairs"])
                 remaining = preview_plan["scheduled_count"] - completed
                 inconclusive = sum(
                     item.get("comparability_status", "comparable") == "inconclusive"
@@ -1553,8 +1943,10 @@ def run(args: argparse.Namespace) -> int:
                 )
                 phase_settings = preview_plan["execution_context"]["collection_config"]
                 print(f"[CYCLE] Frozen experiment {args.experiment_id}: "
-                      f"{completed}/{preview_plan['scheduled_count']} processed pairs "
-                      f"({completed - inconclusive} comparable, {inconclusive} inconclusive), "
+                      f"{completed}/{preview_plan['scheduled_count']} "
+                      f"{'captured' if deferred else 'processed'} pairs "
+                      f"({len(preview_plan['completed_pairs']) - inconclusive} comparable, "
+                      f"{inconclusive} inconclusive), "
                       f"{remaining} remaining")
             else:
                 reference = config.get("target", {}).get("reference_payload")
@@ -1585,6 +1977,8 @@ def run(args: argparse.Namespace) -> int:
             total_min = remaining * phase_min
             print(f"[CYCLE] Minimum phase time {total_min / 3600:.2f} hours "
                   f"({phase_min:g} seconds per pair); this invocation cap {cycle_max_sets} pairs")
+            if frozen_preview_plan is None or frozen_preview_plan.get("deferred_analysis") is True:
+                print("[CYCLE] Capture-only execution; run --finalize-analysis after collection.")
             if continue_inconclusive:
                 print("[CYCLE] Inconclusive state/recovery comparisons will be logged and continued.")
         if args.mutation_profile:
@@ -1607,15 +2001,28 @@ def run(args: argparse.Namespace) -> int:
     try:
         with runner._execution_lock(store):
             if paired_cycle:
-                result = runner.run_paired_cycle(
-                    store=store, source_bus=source_bus, random_seed=args.random_seed,
-                    selector=selector, dbc_path=dbc_path,
-                    undefined_max_bits=args.undefined_max_bits, max_sets=cycle_max_sets,
-                    continue_inconclusive=continue_inconclusive,
-                    cycle_family=cycle_family,
-                )
-                if result["status"] == "completed":
-                    store.complete()
+                cycle_path = store.path / "pairs" / "cycle.json"
+                deferred = True
+                if cycle_path.is_file():
+                    with cycle_path.open("r", encoding="utf-8") as handle:
+                        deferred = json.load(handle).get("deferred_analysis") is True
+                if deferred:
+                    result = runner.run_deferred_paired_cycle(
+                        store=store, source_bus=source_bus, random_seed=args.random_seed,
+                        selector=selector, dbc_path=dbc_path,
+                        undefined_max_bits=args.undefined_max_bits,
+                        max_sets=cycle_max_sets, cycle_family=cycle_family,
+                    )
+                else:
+                    result = runner.run_paired_cycle(
+                        store=store, source_bus=source_bus, random_seed=args.random_seed,
+                        selector=selector, dbc_path=dbc_path,
+                        undefined_max_bits=args.undefined_max_bits, max_sets=cycle_max_sets,
+                        continue_inconclusive=continue_inconclusive,
+                        cycle_family=cycle_family,
+                    )
+                    if result["status"] == "completed":
+                        store.complete()
             else:
                 reconciled = store.reconcile_analyzed_trials()
                 if reconciled:

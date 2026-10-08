@@ -335,3 +335,54 @@ def advance_cycle(
     updated["status"] = "completed" if len(updated["completed_pairs"]) == updated["scheduled_count"] else "active"
     validate_cycle_plan(updated)
     return updated
+
+
+def validate_deferred_cycle(plan: Mapping[str, Any], *, dbc_path: str | Path | None = None,
+                            selected_family: str | None | object = _UNSPECIFIED_FAMILY) -> None:
+    """Validate a capture ledger separate from the later analysis ledger."""
+    validate_cycle_plan(plan, dbc_path=dbc_path, selected_family=selected_family)
+    if plan.get("deferred_analysis") is not True:
+        raise ValueError("cycle is not configured for deferred analysis")
+    captured = plan.get("captured_pairs")
+    if not isinstance(captured, list):
+        raise ValueError("deferred cycle has no capture ledger")
+    scheduled = [entry["index"] for entry in plan["entries"]
+                 if entry["disposition"] == "scheduled"]
+    if len(captured) > len(scheduled):
+        raise ValueError("capture ledger exceeds scheduled cases")
+    for position, item in enumerate(captured):
+        if (not isinstance(item, Mapping)
+                or item.get("entry_index") != scheduled[position]
+                or not isinstance(item.get("pair_id"), str)
+                or not item["pair_id"].startswith("pair_")
+                or not item["pair_id"][5:].isdigit()):
+            raise ValueError("capture ledger is not a valid scheduled prefix")
+    if len({item["pair_id"] for item in captured}) != len(captured):
+        raise ValueError("capture pair IDs are not unique")
+    completed = plan["completed_pairs"]
+    if len(completed) > len(captured) or any(
+        item["entry_index"] != captured[index]["entry_index"]
+        or item["pair_id"] != captured[index]["pair_id"]
+        for index, item in enumerate(completed)
+    ):
+        raise ValueError("analysis ledger is not a prefix of captured pairs")
+
+
+def advance_captured_cycle(plan: Mapping[str, Any], entry_index: int,
+                           pair_id: str) -> dict[str, Any]:
+    """Record one fully captured pair without claiming an analysis verdict."""
+    validate_deferred_cycle(plan)
+    captured = plan["captured_pairs"]
+    scheduled = [entry["index"] for entry in plan["entries"]
+                 if entry["disposition"] == "scheduled"]
+    if len(captured) >= len(scheduled) or entry_index != scheduled[len(captured)]:
+        raise ValueError("cycle can capture only its next scheduled entry")
+    if (not isinstance(pair_id, str) or not pair_id.startswith("pair_")
+            or not pair_id[5:].isdigit()
+            or any(item["pair_id"] == pair_id for item in captured)):
+        raise ValueError("pair_id must identify a new persisted pair")
+    updated = copy.deepcopy(dict(plan))
+    updated["captured_pairs"].append({"entry_index": entry_index, "pair_id": pair_id})
+    updated["status"] = "active"
+    validate_deferred_cycle(updated)
+    return updated

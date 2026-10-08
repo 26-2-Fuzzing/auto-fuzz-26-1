@@ -26,12 +26,12 @@ Trial N: 단일 mutation 반복 송신
 
 권장 실행 단위는 **mutation/no-op 짝 세트**입니다. 같은 원본 payload와 미리 고정한
 mutation을 사용해 각각 `baseline → normal → mutation 또는 no-op → recovery` 전체를
-새로 캡처합니다. 두 구간의 순서는 세트마다 교대하여 순서 효과를 줄입니다. 첫 구간의
-recovery가 송신 전 상태로 돌아왔다는 증거가 부족하면 둘째 구간 송신을 중단합니다.
-두 구간이 모두 완료되어도 짝 비교는 `diagnostic / unverified`이며 자동 exploit이나 다음
-mutation 선택에 사용되지 않습니다. 두 구간을 비교한 결과가 `inconclusive`이면
-그 이유를 저장하고 같은 experiment의 후속 세트도 중단합니다. 장비 상태와 수집 품질을
-별도로 확인한 뒤에만 새 실험을 시작하십시오.
+새로 캡처합니다. 두 구간의 순서는 세트마다 교대하여 순서 효과를 줄입니다. 새
+`--paired-cycle`에서는 첫 구간의 원본 payload나 캡처 무결성을 확인할 수 없으면 둘째
+구간 송신을 중단합니다. 조명·잠금 상태 변화는 기록하며 자동 중단 조건으로 삼지
+않습니다. 짝 비교는 수집 후 진행하고 결과는 `diagnostic / unverified`이며 자동
+exploit이나 다음 mutation 선택에 사용되지 않습니다. 기존 `--paired-sets`의 즉시
+분석 방식은 비교 결과가 `inconclusive`이면 후속 세트를 중단할 수 있습니다.
 
 ## 최초 설정
 
@@ -103,6 +103,24 @@ python3 experiment_runner.py \
 `A5.dbc`·기준 payload에서는 원시 361개 중 281개가 실행 계획에 포함됩니다.
 `undefined_enum` 53개는 앞선 `signal_single`과 송신 내용이 모두 같아 별도
 송신하지 않습니다. `all-0x366`은 계열의 합집합이지 추가 단계가 아닙니다.
+
+새 순차 사이클은 실행 중 원본 payload와 TX/RX 캡처 무결성을 확인하고,
+조명·잠금 등 복구 상태 변화는 관측으로 기록합니다. 상세 anomaly/feedback·페어
+비교는 수집이 끝난 뒤 오프라인 명령으로 작성합니다. 상태 변화 자체는 다음 송신을
+자동 중단하지 않으며, 0x3D6의 `LH_Aussenlicht_def` 신호 변화만
+`review_required`에서 제외합니다. 캡처 무결성이나 원본 payload 확인에 실패하면
+다음 송신을 중단하고 이미 수집한 로그는 보존합니다.
+
+```bash
+python3 experiment_runner.py \
+  --config experiment_runner.yaml \
+  --experiment-id 42 \
+  --finalize-analysis
+```
+
+`--finalize-analysis`는 SSH 연결과 CAN 송신 없이 저장된 로그를 분석하며, 중단 후
+재실행하면 완료되지 않은 분석부터 이어갑니다. 기존에 생성된 순차 사이클은
+기존 실행 방식을 유지합니다.
 
 각 구간의 예시 수집 시간은 30+10+1+20=61초이므로 한 세트는 송신·캡처 구간만
 최소 122초이며, 장비 시작/정지·회복 확인·원본 재측정 시간이 추가됩니다. 시간만

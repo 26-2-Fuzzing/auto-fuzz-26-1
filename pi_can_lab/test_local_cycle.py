@@ -643,9 +643,11 @@ class LocalCycleTests(unittest.TestCase):
             ])
             with patch("experiment_runner.ExperimentRunner") as manager, \
                  redirect_stdout(io.StringIO()):
-                manager.return_value.run_paired_cycle.return_value = {"status": "completed"}
+                manager.return_value.run_deferred_paired_cycle.return_value = {
+                    "status": "capture_active",
+                }
                 self.assertEqual(run(args), 0)
-            kwargs = manager.return_value.run_paired_cycle.call_args.kwargs
+            kwargs = manager.return_value.run_deferred_paired_cycle.call_args.kwargs
             self.assertEqual(kwargs["cycle_family"], "signal_single")
             snapshot = json.loads((root / "experiments" / "experiment_0044" /
                                    "experiment.json").read_text())

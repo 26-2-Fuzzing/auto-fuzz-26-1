@@ -300,6 +300,114 @@ class PairRunnerTests(unittest.TestCase):
             manifest = json.loads((store.path / "pairs" / "pair_0001.json").read_text())
             self.assertEqual(manifest["comparability_status"], "inconclusive")
 
+    def test_comparable_pair_with_post_exposure_change_still_pauses_campaign(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner, store, selector = self.make_runner(Path(directory))
+            calls = []
+
+            def record(**kwargs):
+                calls.append(kwargs["expected_trial_id"])
+                return self.write_completed_episode(**kwargs)
+
+            runner.run_trial = record
+            with patch("experiment_runner.recovery_returned_to_prestate", return_value={
+                "status": "stable", "reasons": [],
+            }), patch("experiment_runner.analyze_trial_pair", return_value={
+                "comparability": {"status": "comparable", "reasons": []},
+                "next_pair_gate": {"status": "review_required", "reasons": ["light fault"]},
+            }):
+                with self.assertRaisesRegex(RuntimeError, "recovery requires review"):
+                    runner.run_paired_set(
+                        store=store, source_bus="b_can", can_id=0x366,
+                        random_seed=366, selector=selector, dbc_path=None,
+                    )
+                with self.assertRaisesRegex(RuntimeError, "recovery requires review"):
+                    runner.run_paired_set(
+                        store=store, source_bus="b_can", can_id=0x366,
+                        random_seed=366, selector=selector, dbc_path=None,
+                    )
+            self.assertEqual(calls, [1, 2])
+            manifest = json.loads((store.path / "pairs" / "pair_0001.json").read_text())
+            self.assertEqual(manifest["comparability_status"], "comparable")
+
+    def test_continue_inconclusive_does_not_bypass_observed_recovery_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner, store, selector = self.make_runner(Path(directory))
+            calls = []
+
+            def record(**kwargs):
+                calls.append(kwargs["expected_trial_id"])
+                return self.write_completed_episode(**kwargs)
+
+            runner.run_trial = record
+            with patch("experiment_runner.recovery_returned_to_prestate", return_value={
+                "status": "inconclusive", "observed_change": True,
+                "reasons": ["B_CAN 0x3D6 LH_Aussenlicht_def state changed"],
+            }):
+                with self.assertRaisesRegex(RuntimeError, "observed change"):
+                    runner.run_paired_set(
+                        store=store, source_bus="b_can", can_id=0x366,
+                        random_seed=366, selector=selector, dbc_path=None,
+                        continue_inconclusive=True,
+                    )
+            self.assertEqual(calls, [1])
+
+    def test_continue_inconclusive_does_not_bypass_post_exposure_review(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner, store, selector = self.make_runner(Path(directory))
+            calls = []
+
+            def record(**kwargs):
+                calls.append(kwargs["expected_trial_id"])
+                return self.write_completed_episode(**kwargs)
+
+            runner.run_trial = record
+            with patch("experiment_runner.recovery_returned_to_prestate", return_value={
+                "status": "stable", "reasons": [],
+            }), patch("experiment_runner.analyze_trial_pair", return_value={
+                "comparability": {"status": "comparable", "reasons": []},
+                "next_pair_gate": {"status": "review_required", "reasons": ["light fault"]},
+            }):
+                for _ in range(2):
+                    with self.assertRaisesRegex(RuntimeError, "recovery requires review"):
+                        runner.run_paired_set(
+                            store=store, source_bus="b_can", can_id=0x366,
+                            random_seed=366, selector=selector, dbc_path=None,
+                            continue_inconclusive=True,
+                        )
+            self.assertEqual(calls, [1, 2])
+
+    def test_legacy_post_exposure_report_requires_review_on_resume(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner, store, selector = self.make_runner(Path(directory))
+            calls = []
+
+            def record(**kwargs):
+                calls.append(kwargs["expected_trial_id"])
+                return self.write_completed_episode(**kwargs)
+
+            runner.run_trial = record
+            with patch("experiment_runner.recovery_returned_to_prestate", return_value={
+                "status": "stable", "reasons": [],
+            }), patch("experiment_runner.analyze_trial_pair", return_value={
+                "schema_version": 1,
+                "comparability": {"status": "inconclusive", "reasons": ["light fault"]},
+                "state_comparison": {"second_recovery": {"status": "inconclusive"}},
+            }):
+                with self.assertRaisesRegex(RuntimeError, "recovery requires review"):
+                    runner.run_paired_set(
+                        store=store, source_bus="b_can", can_id=0x366,
+                        random_seed=366, selector=selector, dbc_path=None,
+                        continue_inconclusive=True,
+                    )
+            with self.assertRaisesRegex(RuntimeError, "Latest pair recovery requires review"):
+                runner.run_paired_set(
+                    store=store, source_bus="b_can", can_id=0x366,
+                    random_seed=366, selector=selector, dbc_path=None,
+                    continue_inconclusive=True,
+                )
+            self.assertEqual(calls, [1, 2])
+
     def test_advisory_inconclusive_report_allows_next_pair(self):
         with tempfile.TemporaryDirectory() as directory:
             runner, store, selector = self.make_runner(Path(directory))
