@@ -200,3 +200,12 @@ class ExperimentStore:
         value["status"] = "completed"
         value["completed_at"] = utc_now()
         _atomic_json(path, value)
+
+    def mark_captured(self) -> None:
+        """Finish raw collection while leaving detailed analysis for a later pass."""
+        path = self.path / "experiment.json"
+        with path.open("r", encoding="utf-8") as handle:
+            value = json.load(handle)
+        value["status"] = "captured"
+        value["captured_at"] = utc_now()
+        _atomic_json(path, value)

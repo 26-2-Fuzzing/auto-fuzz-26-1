@@ -104,6 +104,28 @@ def _noop_tx_records(phases: dict[str, int]) -> list[dict]:
     return records
 
 
+def _mutation_tx_records() -> list[dict]:
+    original = "00000000200000F0"
+    mutated = "0000000020000018"
+    common = {"trial_kind": "mutation", "experiment_id": 1, "execute": True,
+              "tx_session_id": "captured-replay-session"}
+    return [
+        {"record_type": "tx_session_start", **common, "trial_contract_version": 1,
+         "campaign": {"enabled": True, "normal_data_hex": original},
+         "mutation": {"trial_mutation_id": 1, "control_noop": False}},
+        {"record_type": "can_tx", "status": "sent", "phase": "normal",
+         "arbitration_id": 0x366, "data_hex": original, "trial_kind": "mutation"},
+        {"record_type": "can_tx", "status": "sent", "phase": "mutation",
+         "arbitration_id": 0x366, "data_hex": mutated, "trial_kind": "mutation"},
+        {"record_type": "can_tx", "status": "sent", "phase": "recovery",
+         "kind": "restore", "arbitration_id": 0x366,
+         "data_hex": original, "trial_kind": "mutation"},
+        {"record_type": "tx_session_end", **common, "trial_contract_version": 1,
+         "status": "completed", "phase_sent": {"normal": 1, "mutation": 1},
+         "restore": {"status": "sent", "sent": 1}},
+    ]
+
+
 def _synthetic_candidate(**kwargs):
     candidate = {
         "target_bus": "I_CAN", "target_id": "0x456", "type": "PAYLOAD_CHANGE",
@@ -119,6 +141,122 @@ def _synthetic_candidate(**kwargs):
 
 
 class ReplayTrialAnalysisTests(unittest.TestCase):
+    def test_verified_capture_only_replay_is_analyzed_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = _fixture(Path(directory))
+            trial = root / "trial_0001"
+            metadata_path = trial / "metadata.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata.update({
+                "status": "captured",
+                "replay_source": {"experiment_id": 5, "trial_id": 6,
+                                  "mutation_id": 3,
+                                  "tx_manifest_sha256": "source-manifest-digest"},
+                "logs": {bus: f"{bus}.jsonl" for bus in ("p_can", "b_can", "i_can")},
+                "capture_quality": {bus: {"phase_coverage": "verified"}
+                                    for bus in ("p_can", "b_can", "i_can")},
+            })
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+            (trial / "p_can.jsonl").write_text(
+                _frame(2 * NS, "p_can", 0x123, "00"), encoding="utf-8"
+            )
+            (trial / "tx.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in _mutation_tx_records()),
+                encoding="utf-8",
+            )
+            before = {str(path.relative_to(root)): path.read_bytes()
+                      for path in root.rglob("*") if path.is_file()}
+            with patch("replay_trial_analysis.analyze_trial",
+                       side_effect=_synthetic_candidate) as analyze:
+                report = replay_experiment(root, trial_ids={1})
+            after = {str(path.relative_to(root)): path.read_bytes()
+                     for path in root.rglob("*") if path.is_file()}
+            self.assertEqual(before, after)
+            self.assertEqual(analyze.call_count, 1)
+            self.assertEqual(report["trials"][0]["source_status"], "captured")
+            self.assertEqual(report["aggregate"]["completed_trial_count"], 0)
+            self.assertEqual(report["aggregate"]["captured_replay_trial_count"], 1)
+            self.assertEqual(report["aggregate"]["captured_mutation_replay_trial_count"], 1)
+            self.assertEqual(report["aggregate"]["captured_no_op_replay_trial_count"], 0)
+
+            metadata["capture_quality"]["i_can"]["phase_coverage"] = "unverified_clock_reference"
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+            with patch("replay_trial_analysis.analyze_trial") as analyze:
+                rejected = replay_experiment(root, trial_ids={1})
+            analyze.assert_not_called()
+            self.assertEqual(rejected["trials"], [])
+            self.assertIn("verified", rejected["skipped_trials"][0]["reason"])
+
+            metadata["capture_quality"]["i_can"]["phase_coverage"] = "verified"
+            metadata.pop("replay_source")
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+            with patch("replay_trial_analysis.analyze_trial") as analyze:
+                unrelated = replay_experiment(root, trial_ids={1})
+            analyze.assert_not_called()
+            self.assertEqual(unrelated["trials"], [])
+
+    def test_verified_capture_only_no_op_replay_counts_as_comparable_control(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = _fixture(Path(directory), no_op=True)
+            trial = root / "trial_0001"
+            metadata_path = trial / "metadata.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata.update({
+                "status": "captured",
+                "replay_source": {"experiment_id": 5, "trial_id": 4,
+                                  "mutation_id": 4, "trial_kind": "noop",
+                                  "tx_manifest_sha256": "source-manifest-digest"},
+                "logs": {bus: f"{bus}.jsonl" for bus in ("p_can", "b_can", "i_can")},
+                "capture_quality": {bus: {"phase_coverage": "verified"}
+                                    for bus in ("p_can", "b_can", "i_can")},
+            })
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+            (trial / "p_can.jsonl").write_text(
+                _frame(2 * NS, "p_can", 0x123, "00"), encoding="utf-8"
+            )
+            tx_path = trial / "tx.jsonl"
+            tx_path.write_text(
+                "".join(json.dumps(row) + "\n" for row in _noop_tx_records(
+                    metadata["phase_times_ns"])), encoding="utf-8",
+            )
+            before = {str(path.relative_to(root)): path.read_bytes()
+                      for path in root.rglob("*") if path.is_file()}
+            with patch("replay_trial_analysis.analyze_trial",
+                       side_effect=_synthetic_candidate) as analyze:
+                report = replay_experiment(root, trial_ids={1})
+            after = {str(path.relative_to(root)): path.read_bytes()
+                     for path in root.rglob("*") if path.is_file()}
+            self.assertEqual(before, after)
+            self.assertEqual(analyze.call_count, 1)
+            self.assertEqual(report["trials"][0]["trial_kind"], "no_op")
+            self.assertEqual(report["trials"][0]["tx_evidence"]["control_status"], "comparable")
+            self.assertEqual(report["aggregate"]["captured_replay_trial_count"], 1)
+            self.assertEqual(report["aggregate"]["captured_no_op_replay_trial_count"], 1)
+            self.assertEqual(report["aggregate"]["captured_mutation_replay_trial_count"], 0)
+            self.assertEqual(report["aggregate"]["no_op_trial_count"], 1)
+            self.assertEqual(report["aggregate"]["comparable_no_op_trial_count"], 1)
+            self.assertEqual(report["aggregate"]["no_op_false_alert_events"], 1)
+
+            metadata["replay_source"]["trial_kind"] = "mutation"
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+            with patch("replay_trial_analysis.analyze_trial") as analyze:
+                rejected = replay_experiment(root, trial_ids={1})
+            analyze.assert_not_called()
+            self.assertEqual(rejected["trials"], [])
+            self.assertIn("verified", rejected["skipped_trials"][0]["reason"])
+
+            metadata["replay_source"]["trial_kind"] = "noop"
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+            records = _noop_tx_records(metadata["phase_times_ns"])
+            records[-1]["status"] = "interrupted"
+            tx_path.write_text(
+                "".join(json.dumps(row) + "\n" for row in records), encoding="utf-8"
+            )
+            with patch("replay_trial_analysis.analyze_trial") as analyze:
+                with self.assertRaisesRegex(ValueError, "did not complete"):
+                    replay_experiment(root, trial_ids={1})
+            analyze.assert_not_called()
+
     def test_trial_selector_and_passive_quartets(self) -> None:
         self.assertEqual(parse_trial_specs(["1,3-4", "7"]), {1, 3, 4, 7})
         with self.assertRaises(ValueError):

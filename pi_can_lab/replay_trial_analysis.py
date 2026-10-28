@@ -90,6 +90,38 @@ def _trial_kind(metadata: Mapping[str, Any], mutation: MutationCase) -> str:
     return value
 
 
+def _verified_capture_only_replay(path: Path, metadata: Mapping[str, Any]) -> bool:
+    """Only admit capture-only trials produced by the exact replay runner."""
+    provenance = metadata.get("replay_source")
+    trial_kind = metadata.get("trial_kind")
+    if trial_kind == "noop":
+        trial_kind = "no_op"
+    source_kind = provenance.get("trial_kind") if isinstance(provenance, Mapping) else None
+    if source_kind == "noop":
+        source_kind = "no_op"
+    if (not isinstance(provenance, Mapping)
+            or trial_kind not in {"mutation", "no_op"}
+            or (source_kind is not None and source_kind != trial_kind)
+            or not all(provenance.get(key) for key in (
+                "experiment_id", "trial_id", "mutation_id", "tx_manifest_sha256"
+            ))
+            or not (path / "tx.jsonl").is_file()):
+        return False
+    buses = ("p_can", "b_can", "i_can")
+    logs = metadata.get("logs")
+    quality = metadata.get("capture_quality")
+    if (not isinstance(logs, Mapping) or not isinstance(quality, Mapping)
+            or set(logs) != set(buses)):
+        return False
+    return all(
+        logs[bus] == f"{bus}.jsonl"
+        and (path / f"{bus}.jsonl").is_file()
+        and isinstance(quality.get(bus), Mapping)
+        and quality[bus].get("phase_coverage") == "verified"
+        for bus in buses
+    )
+
+
 def _resolve_dbc(
     experiment_dir: Path, config: Mapping[str, Any], explicit: Path | None,
 ) -> tuple[Path | None, str | None]:
@@ -486,10 +518,21 @@ def replay_experiment(
             skipped.append({"trial_id": trial_id, "reason": "missing metadata or mutation file"})
             continue
         metadata = _read_json(metadata_path)
-        if metadata.get("status") != "completed":
-            skipped.append({"trial_id": trial_id, "reason": f"status={metadata.get('status')!r}"})
+        source_status = metadata.get("status")
+        if source_status not in {"completed", "captured"}:
+            skipped.append({"trial_id": trial_id, "reason": f"status={source_status!r}"})
+            continue
+        if source_status == "captured" and not _verified_capture_only_replay(path, metadata):
+            skipped.append({"trial_id": trial_id,
+                            "reason": "captured trial lacks verified exact-replay evidence"})
             continue
         mutation = MutationCase.from_dict(_read_json(mutation_path))
+        if source_status == "captured":
+            # The original collection validated this manifest. Check it again so
+            # edited or truncated files cannot be presented as captured evidence.
+            from experiment_runner import verify_trial_tx
+            verify_trial_tx(path / "tx.jsonl", mutation=mutation,
+                            experiment_id=int(experiment["experiment_id"]))
         kind = _trial_kind(metadata, mutation)
         if kinds is not None and kind not in kinds:
             continue
@@ -524,6 +567,7 @@ def replay_experiment(
                                    experiment.get("experiment_id"))
         trial_results.append({
             "trial_id": trial_id,
+            "source_status": source_status,
             "trial_kind": kind,
             "source_bus": mutation.source_bus.upper(),
             "source_id": f"0x{mutation.can_id:X}",
@@ -571,7 +615,20 @@ def replay_experiment(
         "trials": trial_results,
         "skipped_trials": skipped,
         "aggregate": {
-            "completed_trial_count": len(trial_results),
+            "completed_trial_count": sum(
+                trial["source_status"] == "completed" for trial in trial_results
+            ),
+            "captured_replay_trial_count": sum(
+                trial["source_status"] == "captured" for trial in trial_results
+            ),
+            "captured_mutation_replay_trial_count": sum(
+                trial["source_status"] == "captured" and trial["trial_kind"] == "mutation"
+                for trial in trial_results
+            ),
+            "captured_no_op_replay_trial_count": sum(
+                trial["source_status"] == "captured" and trial["trial_kind"] == "no_op"
+                for trial in trial_results
+            ),
             "mutation_trial_count": sum(trial["trial_kind"] == "mutation" for trial in trial_results),
             "no_op_trial_count": len(no_op),
             "no_op_trials_with_false_alert": sum(bool(trial["analysis"]["no_op_false_alert_count"]) for trial in no_op),

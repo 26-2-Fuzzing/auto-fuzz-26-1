@@ -349,8 +349,109 @@ def verify_trial_tx(
     restored = [record for record in sent["recovery"] if record.get("kind") == "restore"]
     if (restore.get("status") != "sent" or int(restore.get("sent", 0)) != 1
             or len(restored) != 1
-            or str(restored[0].get("data_hex", "")).upper() != expected_normal):
+            or str(restored[0].get("data_hex", "")).upper() != expected_normal
+            or int(restored[0].get("arbitration_id", -1)) != mutation.can_id):
         raise ValueError("TX manifest lacks the required original-payload restore")
+
+
+REPLAY_TIMING_KEYS = (
+    "baseline_seconds", "normal_seconds", "mutation_seconds", "post_seconds", "interval_ms",
+)
+
+
+def load_replay_source(
+    trial_dir: Path, config: Mapping[str, Any], source_bus: str, can_id: int,
+) -> tuple[MutationCase, dict[str, Any]]:
+    """Read a completed trial as an exact, independently verified TX template."""
+    trial_dir = trial_dir.expanduser().resolve()
+    trial_match = re.fullmatch(r"trial_(\d+)", trial_dir.name)
+    experiment_match = re.fullmatch(r"experiment_(\d+)", trial_dir.parent.name)
+    if not trial_match or not experiment_match:
+        raise ConfigurationError("--replay-trial must name an experiment_N/trial_N directory")
+    metadata_path = trial_dir / "metadata.json"
+    mutation_path = trial_dir / "mutation.json"
+    tx_path = trial_dir / "tx.jsonl"
+    if not all(path.is_file() for path in (metadata_path, mutation_path, tx_path)):
+        raise ConfigurationError("Replay source needs metadata.json, mutation.json, and tx.jsonl")
+    with metadata_path.open("r", encoding="utf-8") as handle:
+        metadata = json.load(handle)
+    with mutation_path.open("r", encoding="utf-8") as handle:
+        mutation = MutationCase.from_dict(json.load(handle))
+    source_experiment_id = int(experiment_match.group(1))
+    source_trial_id = int(trial_match.group(1))
+    if (metadata.get("status") != "completed"
+            or int(metadata.get("experiment_id", -1)) != source_experiment_id
+            or int(metadata.get("trial_id", -1)) != source_trial_id
+            or int(metadata.get("mutation_id", -1)) != mutation.mutation_id
+            or metadata.get("trial_kind") not in {"mutation", "noop"}
+            or mutation.trial_kind != metadata.get("trial_kind")):
+        raise ConfigurationError("Replay source is not a matching completed mutation or no-op trial")
+    if (normalize_bus(str(metadata.get("source_bus", ""))) != source_bus
+            or mutation.source_bus != source_bus
+            or parse_int(metadata.get("target_id"), "source target ID") != can_id
+            or mutation.can_id != can_id):
+        raise ConfigurationError("Replay source bus or CAN ID differs from the requested target")
+    recorded_settings = metadata.get("collection_config") or {}
+    current_settings = trial_settings(config.get("trial", {}))
+    if any(float(recorded_settings.get(key, -1)) != current_settings[key]
+           for key in REPLAY_TIMING_KEYS):
+        raise ConfigurationError(
+            "Replay trial timing differs from the saved source (baseline/normal/mutation/recovery/interval)"
+        )
+    verify_trial_tx(tx_path, mutation=mutation, experiment_id=source_experiment_id)
+    with tx_path.open("r", encoding="utf-8") as handle:
+        start = next(json.loads(line) for line in handle
+                     if json.loads(line).get("record_type") == "tx_session_start")
+    campaign = start.get("campaign") or {}
+    recorded_campaign = (
+        campaign.get("baseline_duration_seconds"), campaign.get("normal_duration_seconds"),
+        campaign.get("mutation_duration_seconds"), campaign.get("recovery_duration_seconds"),
+        (start.get("transmission") or {}).get("interval_ms"),
+    )
+    if any(float(observed) != current_settings[key]
+           for observed, key in zip(recorded_campaign, REPLAY_TIMING_KEYS)):
+        raise ConfigurationError("Replay TX manifest timing differs from the saved trial settings")
+    phase_times = load_phase_times(tx_path)
+    phase_tolerance = max(0.1, 2 * current_settings["interval_ms"] / 1000)
+    for phase, setting in (
+        ("baseline", "baseline_seconds"), ("normal", "normal_seconds"),
+        ("mutation", "mutation_seconds"), ("recovery", "post_seconds"),
+    ):
+        actual = (phase_times[f"{phase}_end"] - phase_times[f"{phase}_start"]) / 1e9
+        if abs(actual - current_settings[setting]) > phase_tolerance:
+            raise ConfigurationError(f"Replay TX {phase} phase duration differs from the saved schedule")
+    if metadata.get("phase_times_ns") != phase_times:
+        raise ConfigurationError("Replay metadata and TX phase markers disagree")
+    expected_counts = {
+        phase: math.ceil(current_settings[f"{phase}_seconds"] * 1000
+                         / current_settings["interval_ms"] - 1e-9)
+        for phase in ("normal", "mutation")
+    }
+    observed_counts = {"normal": 0, "mutation": 0}
+    with tx_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            record = json.loads(line)
+            if record.get("record_type") == "can_tx" and record.get("phase") in observed_counts:
+                observed_counts[record["phase"]] += 1
+    if observed_counts != expected_counts:
+        raise ConfigurationError("Replay TX manifest has fewer frames than the saved cadence requires")
+    logs = metadata.get("logs") or {}
+    quality = metadata.get("capture_quality") or {}
+    if any(
+        logs.get(bus) != f"{bus}.jsonl"
+        or not (trial_dir / f"{bus}.jsonl").is_file()
+        or (quality.get(bus) or {}).get("phase_coverage") != "verified"
+        for bus in RECEIVER_CONFIGS
+    ):
+        raise ConfigurationError("Replay source lacks verified B/P/I capture evidence")
+    return mutation, {
+        "experiment_id": source_experiment_id,
+        "trial_id": source_trial_id,
+        "mutation_id": mutation.mutation_id,
+        "trial_kind": mutation.trial_kind,
+        "trial_path": str(trial_dir),
+        "tx_manifest_sha256": hashlib.sha256(tx_path.read_bytes()).hexdigest(),
+    }
 
 
 def parse_candump_payloads(output: str, can_id: int) -> list[bytes]:
@@ -505,7 +606,7 @@ class ExperimentRunner:
         if issues:
             detail = ", ".join(f"{bus}: {reason}" for bus, reason in sorted(issues.items()))
             raise PairedClockPreflightError(
-                f"Paired clock preflight failed before transmission after "
+                f"Clock preflight failed before transmission after "
                 f"{len(next(iter(values.values()))['samples'])} samples per host: {detail}"
             )
         return values
@@ -514,7 +615,7 @@ class ExperimentRunner:
         target = self.config.get("target", {})
         if not bool(target.get("probe_live_payload", True)):
             if require_live:
-                raise ConfigurationError("Paired trials require a live source payload probe")
+                raise ConfigurationError("This trial requires a live source payload probe")
             configured = target.get("reference_payload")
             if configured is None:
                 raise ConfigurationError("target.reference_payload is required when live probing is disabled")
@@ -522,7 +623,7 @@ class ExperimentRunner:
         channel = str(target.get("channel", "can0"))
         samples = max(1, int(target.get("probe_samples", 3)))
         if require_live and samples < 3:
-            raise ConfigurationError("Paired trials require at least three live payload samples")
+            raise ConfigurationError("Live source payload probe requires at least three samples")
         timeout_seconds = float(target.get("probe_timeout_seconds", 6.0))
         mask = "1FFFFFFF" if can_id > 0x7FF else "7FF"
         result = self.managers[source_bus].run([
@@ -532,7 +633,9 @@ class ExperimentRunner:
         payloads = parse_candump_payloads(result.stdout, can_id)
         if not payloads:
             if require_live:
-                raise RuntimeError("Live source payload probe returned no frames for the pair")
+                raise RuntimeError(
+                    f"Live source payload probe returned no frames for 0x{can_id:X} on {source_bus}"
+                )
             configured = target.get("reference_payload")
             if configured is not None:
                 print("[WARN] live payload probe failed; using configured reference_payload")
@@ -598,6 +701,9 @@ class ExperimentRunner:
         selector: TrialStrategySelector,
         dbc_path: Optional[Path],
         reproduce_mutation_id: Optional[int] = None,
+        replay_source: Optional[MutationCase] = None,
+        replay_provenance: Optional[Mapping[str, Any]] = None,
+        capture_tail_seconds: float = 0.0,
         mutation_profile: Optional[str] = None,
         undefined_max_bits: int = 2,
         control_noop: bool = False,
@@ -611,8 +717,25 @@ class ExperimentRunner:
         cycle_entry: Optional[Mapping[str, Any]] = None,
         defer_analysis: bool = False,
     ) -> dict[str, Any]:
-        if defer_analysis and cycle_entry is None:
-            raise ConfigurationError("Deferred analysis requires a frozen paired-cycle entry")
+        if defer_analysis and cycle_entry is None and replay_source is None:
+            raise ConfigurationError("Deferred analysis requires a frozen cycle or exact trial replay")
+        if replay_source is not None and (
+            replay_provenance is None or reproduce_mutation_id is not None
+            or mutation_profile is not None or pair_id is not None
+        ):
+            raise ConfigurationError("An exact trial replay must be a standalone trial")
+        if replay_source is None and (replay_provenance is not None or capture_tail_seconds):
+            raise ConfigurationError("Replay provenance and capture tail require a replay source")
+        if not math.isfinite(capture_tail_seconds) or capture_tail_seconds < 0:
+            raise ConfigurationError("capture_tail_seconds must be finite and nonnegative")
+        if replay_source is not None and (
+            replay_source.source_bus != source_bus or replay_source.can_id != can_id
+            or replay_source.trial_kind not in {"mutation", "noop"}
+            or (control_noop and replay_source.trial_kind != "noop")
+        ):
+            raise ConfigurationError("Replay source bus, ID, or trial kind differs from the requested trial")
+        if replay_source is not None:
+            control_noop = replay_source.trial_kind == "noop"
         if control_noop and (reproduce_mutation_id is not None or mutation_profile is not None):
             raise ConfigurationError("A no-op control cannot reproduce or select a mutation profile")
         if pair_id is not None:
@@ -653,14 +776,14 @@ class ExperimentRunner:
                 f"Pair expected trial {expected_trial_id}, but next available trial is {trial_id}"
             )
         clocks = None
-        if pair_id is not None:
+        if pair_id is not None or replay_source is not None:
             try:
                 clocks = self.check_clocks(paired_source_bus=source_bus)
             except PairedClockPreflightError:
                 raise
             except Exception as exc:
                 raise PairedClockPreflightError(
-                    f"Paired clock preflight failed before transmission: {exc}"
+                    f"Clock preflight failed before transmission: {exc}"
                 ) from exc
         trial_dir = store.create_trial(trial_id)
         metadata: dict[str, Any] = {
@@ -688,15 +811,57 @@ class ExperimentRunner:
             })
             if cycle_entry is not None:
                 metadata["cycle_entry"] = dict(cycle_entry)
+        if replay_source is not None:
+            metadata["replay_source"] = dict(replay_provenance)
+            metadata["capture_tail_seconds"] = capture_tail_seconds
+            metadata["analysis_deferred"] = defer_analysis
         store.write_json(trial_dir / "metadata.json", metadata)
         try:
             original = (
                 self.probe_payload(source_bus, can_id, require_live=True)
-                if pair_id is not None else self.probe_payload(source_bus, can_id)
+                if pair_id is not None or replay_source is not None
+                else self.probe_payload(source_bus, can_id)
             )
             if expected_original_payload is not None and original != expected_original_payload:
                 raise RuntimeError("Live source payload differs from the frozen pair reference")
-            if prepared_case is not None:
+            if replay_source is not None:
+                if original != replay_source.original_payload:
+                    raise ConfigurationError(
+                        "Live source payload differs from the recorded trial; refusing exact replay"
+                    )
+                if control_noop:
+                    mutation = replace(
+                        replay_source, mutation_id=trial_id,
+                        generation_reason=(
+                            f"Exact no-op replay of experiment {replay_provenance['experiment_id']} "
+                            f"trial {replay_provenance['trial_id']}"
+                        ),
+                        strategy_mode="CONTROL", created_at=utc_now(),
+                    )
+                    decision = StrategyDecision(
+                        "CONTROL", "EXACT_TRIAL_REPLAY", None, None,
+                        mutation.generation_reason,
+                    )
+                else:
+                    mutation = replace(
+                        replay_source,
+                        mutation_id=int(state["next_mutation_id"]),
+                        parent_mutation_id=replay_source.mutation_id,
+                        reproduction_of_mutation_id=replay_source.mutation_id,
+                        generation_reason=(
+                            f"Exact replay of experiment {replay_provenance['experiment_id']} "
+                            f"trial {replay_provenance['trial_id']} mutation {replay_source.mutation_id}"
+                        ),
+                        strategy_mode="REPRODUCE",
+                        random_seed=replay_source.random_seed,
+                        created_at=utc_now(),
+                    )
+                    decision = StrategyDecision(
+                        "REPRODUCE", "EXACT_TRIAL_REPLAY", replay_source.mutation_id,
+                        replay_source.changed_bytes[0] if replay_source.changed_bytes else None,
+                        mutation.generation_reason,
+                    )
+            elif prepared_case is not None:
                 if (prepared_case.trial_kind != ("noop" if control_noop else "mutation")
                         or prepared_case.source_bus != source_bus
                         or prepared_case.can_id != can_id
@@ -749,7 +914,7 @@ class ExperimentRunner:
                     undefined_max_bits=undefined_max_bits,
                 )
             signal = dbc_signal_metadata(mutation, dbc_path)
-            if signal is not None and prepared_case is None:
+            if signal is not None and prepared_case is None and replay_source is None:
                 mutation = replace(mutation, signal=signal)
             store.write_json(trial_dir / "mutation.json", mutation.to_dict())
 
@@ -797,6 +962,13 @@ class ExperimentRunner:
                 poll_seconds=trial_cfg["watchdog_poll_seconds"],
                 health_check=self.capture.assert_all_running,
             )
+            if capture_tail_seconds:
+                print(f"[CAPTURE] Keeping B/P/I receivers running for {capture_tail_seconds:g} s after TX")
+                tail_end = time.monotonic() + capture_tail_seconds
+                while time.monotonic() < tail_end:
+                    self.capture.assert_all_running()
+                    time.sleep(min(1.0, max(0.0, tail_end - time.monotonic())))
+                self.capture.assert_all_running()
             source_manager.download(remote_stdout, trial_dir / "sender.stdout.log")
             rx_paths = self.capture.stop_and_download(trial_dir)
             captured = False
@@ -1782,6 +1954,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="record pair state/recovery uncertainty and continue the paired cycle")
     parser.add_argument("--random-seed", type=int, default=366)
     parser.add_argument("--reproduce-mutation-id", type=int, help="repeat one completed mutation exactly")
+    parser.add_argument("--replay-trial", type=Path,
+                        help="replay a completed trial in a new experiment with live source and B/P/I capture")
+    parser.add_argument("--capture-tail-seconds", type=float, default=0.0,
+                        help="keep all three receivers running after replay TX ends (default: 0)")
     parser.add_argument("--control-noop", action="store_true", help="send the original payload in the comparison slot; never add control feedback")
     parser.add_argument(
         "--mutation-profile", choices=tuple(PROFILE_FAMILIES),
@@ -1810,6 +1986,20 @@ def run(args: argparse.Namespace) -> int:
     cycle_family = getattr(args, "cycle_family", None)
     continue_inconclusive = getattr(args, "continue_inconclusive", False)
     finalize_analysis = getattr(args, "finalize_analysis", False)
+    replay_trial = getattr(args, "replay_trial", None)
+    capture_tail_seconds = getattr(args, "capture_tail_seconds", 0.0)
+    if replay_trial is not None and (
+        trial_count != 1 or paired_sets or paired_cycle or finalize_analysis
+        or args.reproduce_mutation_id is not None or args.control_noop
+        or args.mutation_profile is not None or args.print_0x366_map
+        or cycle_max_sets is not None or cycle_family is not None
+        or continue_inconclusive
+    ):
+        raise ConfigurationError("--replay-trial needs one standalone trial")
+    if capture_tail_seconds and replay_trial is None:
+        raise ConfigurationError("--capture-tail-seconds requires --replay-trial")
+    if not math.isfinite(capture_tail_seconds) or capture_tail_seconds < 0:
+        raise ConfigurationError("--capture-tail-seconds must be finite and nonnegative")
     if finalize_analysis:
         if args.experiment_id is None:
             raise ConfigurationError("--finalize-analysis requires --experiment-id")
@@ -1887,6 +2077,17 @@ def run(args: argparse.Namespace) -> int:
     if paired_cycle and target_id != 0x366:
         raise ConfigurationError("--paired-cycle is dedicated to CAN ID 0x366")
     source_bus = normalize_bus(args.source_bus)
+    replay_source = None
+    replay_provenance = None
+    if replay_trial is not None:
+        replay_source, replay_provenance = load_replay_source(
+            replay_trial, config, source_bus, target_id,
+        )
+        destination = root / f"experiment_{experiment_id:04d}"
+        if destination.exists():
+            raise ConfigurationError(
+                f"Exact trial replay requires a new experiment ID; {destination} already exists"
+            )
     cycle_file = (
         root / f"experiment_{args.experiment_id:04d}" / "pairs" / "cycle.json"
         if paired_cycle and args.experiment_id is not None else None
@@ -1913,6 +2114,21 @@ def run(args: argparse.Namespace) -> int:
     if not args.execute:
         print("[SAFE] Preview only: no SSH connection or CAN transmission was started.")
         print("[SAFE] Add --execute after reviewing experiment_runner.yaml and the isolated bench.")
+        if replay_source is not None:
+            source_kind = "noop control" if replay_source.trial_kind == "noop" else "mutation"
+            print(
+                f"[REPLAY] Source experiment {replay_provenance['experiment_id']} "
+                f"trial {replay_provenance['trial_id']} {source_kind} {replay_source.mutation_id} "
+                f"-> new experiment {experiment_id} trial 1"
+            )
+            print(
+                f"[REPLAY] {source_bus.upper()} 0x{target_id:X}: "
+                f"{replay_source.original_payload.hex().upper()} -> "
+                f"{replay_source.mutated_payload.hex().upper()}"
+            )
+            print("[REPLAY] Before TX: strict three-host clock check, live source majority/equality, B/P/I capture readiness")
+            print(f"[REPLAY] B/P/I capture tail after TX: {capture_tail_seconds:g} seconds")
+            print("[REPLAY] Capture-only: detailed log analysis is deferred")
         if paired_sets:
             phase = config["trial"]
             print(
@@ -1992,8 +2208,12 @@ def run(args: argparse.Namespace) -> int:
         "undefined_max_bits": args.undefined_max_bits,
         "runner_config": config,
         "trial_kind": "paired_cycle" if paired_cycle else "paired" if paired_sets
-                      else "noop" if args.control_noop else "mutation",
+                      else "noop" if args.control_noop or (
+                          replay_source is not None and replay_source.trial_kind == "noop"
+                      ) else "mutation",
     }
+    if replay_provenance is not None:
+        snapshot["replay_source"] = replay_provenance
     store = ExperimentStore(root, experiment_id, snapshot)
     selector = TrialStrategySelector(config.get("feedback", {}))
     runner = ExperimentRunner(config)
@@ -2041,11 +2261,18 @@ def run(args: argparse.Namespace) -> int:
                             store=store, source_bus=source_bus, can_id=target_id,
                             random_seed=args.random_seed, selector=selector, dbc_path=dbc_path,
                             reproduce_mutation_id=args.reproduce_mutation_id,
+                            replay_source=replay_source,
+                            replay_provenance=replay_provenance,
+                            capture_tail_seconds=capture_tail_seconds,
+                            defer_analysis=replay_source is not None,
                             mutation_profile=args.mutation_profile,
                             undefined_max_bits=args.undefined_max_bits,
                             control_noop=args.control_noop,
                         )
-                store.complete()
+                if replay_source is not None:
+                    store.mark_captured()
+                else:
+                    store.complete()
     finally:
         runner.close()
     return 0

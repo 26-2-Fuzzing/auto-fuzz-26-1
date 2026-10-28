@@ -13,7 +13,7 @@
 
 `experiment_runner.py`는 노트북의 로컬 터미널에서 한 번만 실행한다. 각 Pi에서 `./lab rx`나 `./lab tx`를 별도로 실행하지 않는다.
 
-한 Trial이 완전히 끝나고 세 로그가 회수·분석된 뒤에 관측 후보를 기록한다. 현재 stage 1에서는
+일반 Trial은 세 로그가 회수·분석된 뒤에 관측 후보를 기록한다. 아래의 완료 Trial 재현은 로그 수집과 검증까지만 수행하고 분석은 나중에 진행한다. 현재 stage 1에서는
 자동 Feedback 선택을 차단하고, 다음 Trial은 일반 exploration으로 진행한다. 실행 중인 Trial의
 Mutation은 변경하지 않는다.
 
@@ -355,3 +355,37 @@ python3 experiment_runner.py \
 ```
 
 상세 family, bit map, enum 및 payload sample은 `A5_0X366_MUTATIONS.md`를 참고한다.
+
+## 12. 완료된 Trial의 송신 재현
+
+실험 5의 trial 6을 새 실험에서 한 번만 재현할 때는 Control PC의 `pi_can_lab`에서 다음 명령을 사용한다. 먼저 `--execute` 없이 저장된 TX 기록, 목적지 실험 ID, payload를 확인한다.
+
+```bash
+python3 experiment_runner.py --config experiment_runner.yaml \
+  --source-bus B_CAN --target-id 0x366 \
+  --replay-trial experiments/experiment_0005/trial_0006
+```
+
+실제로 송신하고 B-CAN, P-CAN, I-CAN을 동시에 수집하려면 같은 명령에 `--execute`를 붙인다.
+
+```bash
+python3 experiment_runner.py --config experiment_runner.yaml \
+  --source-bus B_CAN --target-id 0x366 \
+  --replay-trial experiments/experiment_0005/trial_0006 \
+  --execute
+```
+
+Runner는 새 experiment ID를 사용한다. 저장된 trial이 완료 상태이고 TX 기록과 세 버스 캡처 증거가 일치하는지 확인한다. 송신 전에는 세 Pi의 시계 정렬, B-CAN `0x366`의 실시간 원본 다수결 및 저장 원본 `00000000200000F0`과의 일치, 세 버스 receiver 준비 상태를 확인한다. 하나라도 실패하면 송신하지 않는다. 원본 10초/200프레임, 변조 `00008002200000F0` 1초/20프레임, 원본 복원 1프레임, recovery 20초를 50 ms 간격으로 재현한다. TX와 세 수신 로그를 검증한 뒤 새 `experiments/experiment_N/trial_0001/`에 `captured` 상태로 보관하며 상세 분석은 하지 않는다.
+
+`--capture-tail-seconds 1200`을 추가하면 송신 및 20초 recovery가 끝난 뒤 세 버스의 수신만 20분 더 유지한다. 실험 5에서 사용자가 보고한 현상은 trial 6 송신 약 15분 뒤였으므로 지연 현상을 기록하려면 이 옵션이 필요하다. 캡처 크기는 상당히 커질 수 있다. 이 옵션은 CAN 송신 횟수나 송신 일정을 바꾸지 않는다.
+
+`--replay-trial`은 완료된 no-op 대조 trial도 받는다. 예를 들어 실험 5의 `trial_0004`는 원본 `00000000200000F0`을 normal 구간 200프레임과 비교 구간 20프레임에 그대로 보내고 복원 1프레임을 보낸다. 같은 페어의 **변조** `00000480200000F0`을 보내려면 `trial_0003`을 지정한다. 미리보기의 `noop control` 또는 `mutation` 표시를 확인한다.
+
+나중에 분석할 때는 새 실험 번호를 사용해 다음과 같이 별도 JSON 보고서를 만든다.
+
+```bash
+python3 replay_trial_analysis.py experiments/experiment_N --trial 1 \
+  --output /tmp/trial6-replay-analysis.json
+```
+
+이 보고서의 자동 비교 범위는 원래 trial의 baseline부터 recovery까지다. 추가 캡처 구간의 지연 현상은 세 원본 JSONL의 시각을 따로 대조해야 한다.
