@@ -1,0 +1,18 @@
+{
+  "capture_label": "example-only: historical windows, no operator evidence supplied",
+  "timestamp_origin": 0.0,
+  "channel_map": {
+    "0": "B_CAN",
+    "1": "P_CAN",
+    "2": "I_CAN"
+  },
+  "windows": {
+    "baseline": [0, 10],
+    "previous_reference": [10, 15],
+    "reference": [15, 20],
+    "observation": [20, 25],
+    "recovery": [25, 30]
+  },
+  "capture_loss_reported": null,
+  "watch_signals": []
+}

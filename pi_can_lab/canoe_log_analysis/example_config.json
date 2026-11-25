@@ -1,0 +1,18 @@
+{
+  "capture_label": "example-only: sample windows, not evidence of an experiment",
+  "timestamp_origin": 0.0,
+  "channel_map": {
+    "0": "CAN_A",
+    "1": "CAN_B",
+    "2": "CAN_C"
+  },
+  "windows": {
+    "reference": [0, 4],
+    "observation": [4, 8],
+    "recovery": [8, 12]
+  },
+  "edge_tolerance_s": 0.5,
+  "max_signal_gap_s": 2.0,
+  "capture_loss_reported": null,
+  "watch_signals": []
+}
