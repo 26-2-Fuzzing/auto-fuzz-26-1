@@ -3,3 +3,5 @@ logs/
 experiments/
 experiment_runner.yaml
 *.pyc
+*.cbf
+*.cfg.ini

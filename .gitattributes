@@ -1,0 +1,2 @@
+pi_can_lab/canoe-paired-wsl.sh text eol=lf
+pi_can_lab/canoe/config/ThreeChannelCAN.cfg -text -diff

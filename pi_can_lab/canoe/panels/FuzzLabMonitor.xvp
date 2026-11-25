@@ -1,0 +1,601 @@
+<?xml version='1.0' encoding='utf-8'?>
+<Panel Type="Vector.CANalyzer.Panels.PanelSerializer, Vector.CANalyzer.Panels.Serializer, Version=13.0.111.0, Culture=neutral, PublicKeyToken=null">
+  <Object Type="Vector.CANalyzer.Panels.Runtime.Panel, Vector.CANalyzer.Panels.Common, Version=13.0.111.0, Culture=neutral, PublicKeyToken=null" Name="Panel" ControlName="FUZZLAB Monitor" Children="Controls">
+    <Object Type="Vector.CANalyzer.Panels.Design.StaticTextControl, Vector.CANalyzer.Panels.CommonControls, Version=13.0.111.0, Culture=neutral, PublicKeyToken=null" Name="Monitor1" ControlName="Monitor1" Children="Controls">
+      <Property Name="Name">Monitor1</Property>
+      <Property Name="Size">420, 31</Property>
+      <Property Name="Location">18, 8</Property>
+      <Property Name="Font">Segoe UI, 18pt</Property>
+      <Property Name="BackColor">White</Property>
+      <Property Name="ForeColor">25, 40, 65</Property>
+      <Property Name="Text">FUZZLAB  |  MULTI-BUS MONITOR</Property>
+    </Object>
+    <Object Type="Vector.CANalyzer.Panels.Design.TextBoxControl, Vector.CANalyzer.Panels.CommonControls, Version=13.0.111.0, Culture=neutral, PublicKeyToken=null" Name="Monitor2" ControlName="Monitor2" Children="Controls">
+      <Property Name="Name">Monitor2</Property>
+      <Property Name="Size">400, 26</Property>
+      <Property Name="Location">500, 12</Property>
+      <Property Name="Font">Segoe UI, 11pt</Property>
+      <Property Name="BackColor">White</Property>
+      <Property Name="ForeColor">25, 40, 65</Property>
+      <Property Name="ReadOnlyControl">True</Property>
+      <Property Name="ValueDecimalPlaces">0</Property>
+      <Property Name="DisplayLabel">Hide</Property>
+      <Property Name="DescriptionText" />
+      <Property Name="DescriptionSize">0, 0</Property>
+      <Property Name="BoxBorderStyle">None</Property>
+      <Property Name="BoxBackColor">White</Property>
+      <Property Name="BoxForeColor">25, 40, 65</Property>
+      <Property Name="BoxFont">Segoe UI, 11pt</Property>
+      <Property Name="UsedValueTable">PhysicalValue</Property>
+      <Property Name="ValueDisplay">Decimal</Property>
+      <Property Name="SymbolConfiguration">5;16;FuzzDashboard;;;PhaseText;1;;;-1;;;</Property>
+    </Object>
+    <Object Type="Vector.CANalyzer.Panels.Design.TextBoxControl, Vector.CANalyzer.Panels.CommonControls, Version=13.0.111.0, Culture=neutral, PublicKeyToken=null" Name="Monitor3" ControlName="Monitor3" Children="Controls">
+      <Property Name="Name">Monitor3</Property>
+      <Property Name="Size">330, 26</Property>
+      <Property Name="Location">980, 12</Property>
+      <Property Name="Font">Segoe UI, 11pt</Property>
+      <Property Name="BackColor">White</Property>
+      <Property Name="ForeColor">25, 40, 65</Property>
+      <Property Name="ReadOnlyControl">True</Property>
+      <Property Name="ValueDecimalPlaces">0</Property>
+      <Property Name="DisplayLabel">Hide</Property>
+      <Property Name="DescriptionText" />
+      <Property Name="DescriptionSize">0, 0</Property>
+      <Property Name="BoxBorderStyle">None</Property>
+      <Property Name="BoxBackColor">White</Property>
+      <Property Name="BoxForeColor">25, 40, 65</Property>
+      <Property Name="BoxFont">Segoe UI, 11pt</Property>
+      <Property Name="UsedValueTable">PhysicalValue</Property>
+      <Property Name="ValueDisplay">Decimal</Property>
+      <Property Name="SymbolConfiguration">5;16;FuzzDashboard;;;MeasurementState;1;;;-1;;;</Property>
+    </Object>
+    <Object Type="Vector.CANalyzer.Panels.Design.StaticTextControl, Vector.CANalyzer.Panels.CommonControls, Version=13.0.111.0, Culture=neutral, PublicKeyToken=null" Name="Monitor4" ControlName="Monitor4" Children="Controls">
+      <Property Name="Name">Monitor4</Property>
+      <Property Name="Size">120, 24</Property>
+      <Property Name="Location">18, 45</Property>
+      <Property Name="Font">Segoe UI, 9pt</Property>
+      <Property Name="BackColor">White</Property>
+      <Property Name="ForeColor">25, 40, 65</Property>
+      <Property Name="Text">INPUT / OBSERVE</Property>
+    </Object>
+    <Object Type="Vector.CANalyzer.Panels.Design.TextBoxControl, Vector.CANalyzer.Panels.CommonControls, Version=13.0.111.0, Culture=neutral, PublicKeyToken=null" Name="Monitor5" ControlName="Monitor5" Children="Controls">
+      <Property Name="Name">Monitor5</Property>
+      <Property Name="Size">760, 27</Property>
+      <Property Name="Location">140, 43</Property>
+      <Property Name="Font">Segoe UI, 11pt</Property>
+      <Property Name="BackColor">White</Property>
+      <Property Name="ForeColor">25, 40, 65</Property>
+      <Property Name="ReadOnlyControl">True</Property>
+      <Property Name="ValueDecimalPlaces">0</Property>
+      <Property Name="DisplayLabel">Hide</Property>
+      <Property Name="DescriptionText" />
+      <Property Name="DescriptionSize">0, 0</Property>
+      <Property Name="BoxBorderStyle">None</Property>
+      <Property Name="BoxBackColor">White</Property>
+      <Property Name="BoxForeColor">25, 40, 65</Property>
+      <Property Name="BoxFont">Segoe UI, 11pt</Property>
+      <Property Name="UsedValueTable">PhysicalValue</Property>
+      <Property Name="ValueDisplay">Decimal</Property>
+      <Property Name="SymbolConfiguration">5;16;FuzzDashboard;;;SourceText;1;;;-1;;;</Property>
+    </Object>
+    <Object Type="Vector.CANalyzer.Panels.Design.StaticTextControl, Vector.CANalyzer.Panels.CommonControls, Version=13.0.111.0, Culture=neutral, PublicKeyToken=null" Name="Monitor6" ControlName="Monitor6" Children="Controls">
+      <Property Name="Name">Monitor6</Property>
+      <Property Name="Size">340, 23</Property>
+      <Property Name="Location">980, 46</Property>
+      <Property Name="Font">Segoe UI, 10pt</Property>
+      <Property Name="BackColor">White</Property>
+      <Property Name="ForeColor">25, 40, 65</Property>
+      <Property Name="Text">CAN1 = P  /  CAN2 = B  /  CAN3 = I</Property>
+    </Object>
+    <Object Type="Vector.CANalyzer.Panels.Design.StaticTextControl, Vector.CANalyzer.Panels.CommonControls, Version=13.0.111.0, Culture=neutral, PublicKeyToken=null" Name="Monitor7" ControlName="Monitor7" Children="Controls">
+      <Property Name="Name">Monitor7</Property>
+      <Property Name="Size">190, 30</Property>
+      <Property Name="Location">18, 82</Property>
+      <Property Name="Font">Segoe UI, 17pt</Property>
+      <Property Name="BackColor">White</Property>
+      <Property Name="ForeColor">0, 120, 130</Property>
+      <Property Name="Text">CAN1   P-CAN</Property>
+    </Object>
+    <Object Type="Vector.CANalyzer.Panels.Design.TextBoxControl, Vector.CANalyzer.Panels.CommonControls, Version=13.0.111.0, Culture=neutral, PublicKeyToken=null" Name="Monitor8" ControlName="Monitor8" Children="Controls">
+      <Property Name="Name">Monitor8</Property>
+      <Property Name="Size">210, 25</Property>
+      <Property Name="Location">223, 85</Property>
+      <Property Name="Font">Segoe UI, 10pt</Property>
+      <Property Name="BackColor">White</Property>
+      <Property Name="ForeColor">0, 120, 130</Property>
+      <Property Name="ReadOnlyControl">True</Property>
+      <Property Name="ValueDecimalPlaces">0</Property>
+      <Property Name="DisplayLabel">Hide</Property>
+      <Property Name="DescriptionText" />
+      <Property Name="DescriptionSize">0, 0</Property>
+      <Property Name="BoxBorderStyle">None</Property>
+      <Property Name="BoxBackColor">White</Property>
+      <Property Name="BoxForeColor">0, 120, 130</Property>
+      <Property Name="BoxFont">Segoe UI, 10pt</Property>
+      <Property Name="UsedValueTable">PhysicalValue</Property>
+      <Property Name="ValueDisplay">Decimal</Property>
+      <Property Name="SymbolConfiguration">5;16;FuzzDashboard;;;RxState1;1;;;-1;;;</Property>
+    </Object>
+    <Object Type="Vector.CANalyzer.Panels.Design.StaticTextControl, Vector.CANalyzer.Panels.CommonControls, Version=13.0.111.0, Culture=neutral, PublicKeyToken=null" Name="Monitor9" ControlName="Monitor9" Children="Controls">
+      <Property Name="Name">Monitor9</Property>
+      <Property Name="Size">185, 22</Property>
+      <Property Name="Location">18, 122</Property>
+      <Property Name="Font">Segoe UI, 9pt</Property>
+      <Property Name="BackColor">White</Property>
+      <Property Name="ForeColor">25, 40, 65</Property>
+      <Property Name="Text">RECEIVED / node Rx</Property>
+    </Object>
+    <Object Type="Vector.CANalyzer.Panels.Design.StaticTextControl, Vector.CANalyzer.Panels.CommonControls, Version=13.0.111.0, Culture=neutral, PublicKeyToken=null" Name="Monitor10" ControlName="Monitor10" Children="Controls">
+      <Property Name="Name">Monitor10</Property>
+      <Property Name="Size">195, 22</Property>
+      <Property Name="Location">228, 122</Property>
+      <Property Name="Font">Segoe UI, 9pt</Property>
+      <Property Name="BackColor">White</Property>
+      <Property Name="ForeColor">25, 40, 65</Property>
+      <Property Name="Text">INJECTION / submitted</Property>
+    </Object>
+    <Object Type="Vector.CANalyzer.Panels.Design.TextBoxControl, Vector.CANalyzer.Panels.CommonControls, Version=13.0.111.0, Culture=neutral, PublicKeyToken=null" Name="Monitor11" ControlName="Monitor11" Children="Controls">
+      <Property Name="Name">Monitor11</Property>
+      <Property Name="Size">190, 37</Property>
+      <Property Name="Location">18, 145</Property>
+      <Property Name="Font">Segoe UI, 21pt</Property>
+      <Property Name="BackColor">White</Property>
+      <Property Name="ForeColor">0, 120, 130</Property>
+      <Property Name="ReadOnlyControl">True</Property>
+      <Property Name="ValueDecimalPlaces">0</Property>
+      <Property Name="DisplayLabel">Hide</Property>
+      <Property Name="DescriptionText" />
+      <Property Name="DescriptionSize">0, 0</Property>
+      <Property Name="BoxBorderStyle">None</Property>
+      <Property Name="BoxBackColor">White</Property>
+      <Property Name="BoxForeColor">0, 120, 130</Property>
+      <Property Name="BoxFont">Segoe UI, 21pt</Property>
+      <Property Name="UsedValueTable">PhysicalValue</Property>
+      <Property Name="ValueDisplay">Decimal</Property>
+      <Property Name="SymbolConfiguration">5;16;FuzzIO;;;RxCount1;1;;;-1;;;</Property>
+    </Object>
+    <Object Type="Vector.CANalyzer.Panels.Design.TextBoxControl, Vector.CANalyzer.Panels.CommonControls, Version=13.0.111.0, Culture=neutral, PublicKeyToken=null" Name="Monitor12" ControlName="Monitor12" Children="Controls">
+      <Property Name="Name">Monitor12</Property>
+      <Property Name="Size">205, 37</Property>
+      <Property Name="Location">228, 145</Property>
+      <Property Name="Font">Segoe UI, 21pt</Property>
+      <Property Name="BackColor">White</Property>
+      <Property Name="ForeColor">0, 120, 130</Property>
+      <Property Name="ReadOnlyControl">True</Property>
+      <Property Name="ValueDecimalPlaces">0</Property>
+      <Property Name="DisplayLabel">Hide</Property>
+      <Property Name="DescriptionText" />
+      <Property Name="DescriptionSize">0, 0</Property>
+      <Property Name="BoxBorderStyle">None</Property>
+      <Property Name="BoxBackColor">White</Property>
+      <Property Name="BoxForeColor">0, 120, 130</Property>
+      <Property Name="BoxFont">Segoe UI, 21pt</Property>
+      <Property Name="UsedValueTable">PhysicalValue</Property>
+      <Property Name="ValueDisplay">Decimal</Property>
+      <Property Name="SymbolConfiguration">5;16;FuzzIO;;;TxSubmitted1;1;;;-1;;;</Property>
+    </Object>
+    <Object Type="Vector.CANalyzer.Panels.Design.StaticTextControl, Vector.CANalyzer.Panels.CommonControls, Version=13.0.111.0, Culture=neutral, PublicKeyToken=null" Name="Monitor13" ControlName="Monitor13" Children="Controls">
+      <Property Name="Name">Monitor13</Property>
+      <Property Name="Size">68, 22</Property>
+      <Property Name="Location">18, 192</Property>
+      <Property Name="Font">Segoe UI, 9pt</Property>
+      <Property Name="BackColor">White</Property>
+      <Property Name="ForeColor">25, 40, 65</Property>
+      <Property Name="Text">ERRORS</Property>
+    </Object>
+    <Object Type="Vector.CANalyzer.Panels.Design.TextBoxControl, Vector.CANalyzer.Panels.CommonControls, Version=13.0.111.0, Culture=neutral, PublicKeyToken=null" Name="Monitor14" ControlName="Monitor14" Children="Controls">
+      <Property Name="Name">Monitor14</Property>
+      <Property Name="Size">70, 26</Property>
+      <Property Name="Location">88, 189</Property>
+      <Property Name="Font">Segoe UI, 11pt</Property>
+      <Property Name="BackColor">White</Property>
+      <Property Name="ForeColor">25, 40, 65</Property>
+      <Property Name="ReadOnlyControl">True</Property>
+      <Property Name="ValueDecimalPlaces">0</Property>
+      <Property Name="DisplayLabel">Hide</Property>
+      <Property Name="DescriptionText" />
+      <Property Name="DescriptionSize">0, 0</Property>
+      <Property Name="BoxBorderStyle">None</Property>
+      <Property Name="BoxBackColor">White</Property>
+      <Property Name="BoxForeColor">25, 40, 65</Property>
+      <Property Name="BoxFont">Segoe UI, 11pt</Property>
+      <Property Name="UsedValueTable">PhysicalValue</Property>
+      <Property Name="ValueDisplay">Decimal</Property>
+      <Property Name="SymbolConfiguration">5;16;FuzzIO;;;ErrorFrame1;1;;;-1;;;</Property>
+    </Object>
+    <Object Type="Vector.CANalyzer.Panels.Design.TextBoxControl, Vector.CANalyzer.Panels.CommonControls, Version=13.0.111.0, Culture=neutral, PublicKeyToken=null" Name="Monitor15" ControlName="Monitor15" Children="Controls">
+      <Property Name="Name">Monitor15</Property>
+      <Property Name="Size">263, 26</Property>
+      <Property Name="Location">170, 189</Property>
+      <Property Name="Font">Segoe UI, 10pt</Property>
+      <Property Name="BackColor">White</Property>
+      <Property Name="ForeColor">25, 40, 65</Property>
+      <Property Name="ReadOnlyControl">True</Property>
+      <Property Name="ValueDecimalPlaces">0</Property>
+      <Property Name="DisplayLabel">Hide</Property>
+      <Property Name="DescriptionText" />
+      <Property Name="DescriptionSize">0, 0</Property>
+      <Property Name="BoxBorderStyle">None</Property>
+      <Property Name="BoxBackColor">White</Property>
+      <Property Name="BoxForeColor">25, 40, 65</Property>
+      <Property Name="BoxFont">Segoe UI, 10pt</Property>
+      <Property Name="UsedValueTable">PhysicalValue</Property>
+      <Property Name="ValueDisplay">Decimal</Property>
+      <Property Name="SymbolConfiguration">5;16;FuzzDashboard;;;BusHealth1;1;;;-1;;;</Property>
+    </Object>
+    <Object Type="Vector.CANalyzer.Panels.Design.StaticTextControl, Vector.CANalyzer.Panels.CommonControls, Version=13.0.111.0, Culture=neutral, PublicKeyToken=null" Name="Monitor16" ControlName="Monitor16" Children="Controls">
+      <Property Name="Name">Monitor16</Property>
+      <Property Name="Size">410, 20</Property>
+      <Property Name="Location">18, 224</Property>
+      <Property Name="Font">Segoe UI, 9pt</Property>
+      <Property Name="BackColor">White</Property>
+      <Property Name="ForeColor">25, 40, 65</Property>
+      <Property Name="Text">LATEST RECEIVED FRAME / sampled at 100 ms</Property>
+    </Object>
+    <Object Type="Vector.CANalyzer.Panels.Design.TextBoxControl, Vector.CANalyzer.Panels.CommonControls, Version=13.0.111.0, Culture=neutral, PublicKeyToken=null" Name="Monitor17" ControlName="Monitor17" Children="Controls">
+      <Property Name="Name">Monitor17</Property>
+      <Property Name="Size">415, 28</Property>
+      <Property Name="Location">18, 247</Property>
+      <Property Name="Font">Segoe UI, 10pt</Property>
+      <Property Name="BackColor">White</Property>
+      <Property Name="ForeColor">25, 40, 65</Property>
+      <Property Name="ReadOnlyControl">True</Property>
+      <Property Name="ValueDecimalPlaces">0</Property>
+      <Property Name="DisplayLabel">Hide</Property>
+      <Property Name="DescriptionText" />
+      <Property Name="DescriptionSize">0, 0</Property>
+      <Property Name="BoxBorderStyle">None</Property>
+      <Property Name="BoxBackColor">White</Property>
+      <Property Name="BoxForeColor">25, 40, 65</Property>
+      <Property Name="BoxFont">Segoe UI, 10pt</Property>
+      <Property Name="UsedValueTable">PhysicalValue</Property>
+      <Property Name="ValueDisplay">Decimal</Property>
+      <Property Name="SymbolConfiguration">5;16;FuzzDashboard;;;LastRx1;1;;;-1;;;</Property>
+    </Object>
+    <Object Type="Vector.CANalyzer.Panels.Design.StaticTextControl, Vector.CANalyzer.Panels.CommonControls, Version=13.0.111.0, Culture=neutral, PublicKeyToken=null" Name="Monitor18" ControlName="Monitor18" Children="Controls">
+      <Property Name="Name">Monitor18</Property>
+      <Property Name="Size">190, 30</Property>
+      <Property Name="Location">458, 82</Property>
+      <Property Name="Font">Segoe UI, 17pt</Property>
+      <Property Name="BackColor">White</Property>
+      <Property Name="ForeColor">57, 100, 200</Property>
+      <Property Name="Text">CAN2   B-CAN</Property>
+    </Object>
+    <Object Type="Vector.CANalyzer.Panels.Design.TextBoxControl, Vector.CANalyzer.Panels.CommonControls, Version=13.0.111.0, Culture=neutral, PublicKeyToken=null" Name="Monitor19" ControlName="Monitor19" Children="Controls">
+      <Property Name="Name">Monitor19</Property>
+      <Property Name="Size">210, 25</Property>
+      <Property Name="Location">663, 85</Property>
+      <Property Name="Font">Segoe UI, 10pt</Property>
+      <Property Name="BackColor">White</Property>
+      <Property Name="ForeColor">57, 100, 200</Property>
+      <Property Name="ReadOnlyControl">True</Property>
+      <Property Name="ValueDecimalPlaces">0</Property>
+      <Property Name="DisplayLabel">Hide</Property>
+      <Property Name="DescriptionText" />
+      <Property Name="DescriptionSize">0, 0</Property>
+      <Property Name="BoxBorderStyle">None</Property>
+      <Property Name="BoxBackColor">White</Property>
+      <Property Name="BoxForeColor">57, 100, 200</Property>
+      <Property Name="BoxFont">Segoe UI, 10pt</Property>
+      <Property Name="UsedValueTable">PhysicalValue</Property>
+      <Property Name="ValueDisplay">Decimal</Property>
+      <Property Name="SymbolConfiguration">5;16;FuzzDashboard;;;RxState2;1;;;-1;;;</Property>
+    </Object>
+    <Object Type="Vector.CANalyzer.Panels.Design.StaticTextControl, Vector.CANalyzer.Panels.CommonControls, Version=13.0.111.0, Culture=neutral, PublicKeyToken=null" Name="Monitor20" ControlName="Monitor20" Children="Controls">
+      <Property Name="Name">Monitor20</Property>
+      <Property Name="Size">185, 22</Property>
+      <Property Name="Location">458, 122</Property>
+      <Property Name="Font">Segoe UI, 9pt</Property>
+      <Property Name="BackColor">White</Property>
+      <Property Name="ForeColor">25, 40, 65</Property>
+      <Property Name="Text">RECEIVED / node Rx</Property>
+    </Object>
+    <Object Type="Vector.CANalyzer.Panels.Design.StaticTextControl, Vector.CANalyzer.Panels.CommonControls, Version=13.0.111.0, Culture=neutral, PublicKeyToken=null" Name="Monitor21" ControlName="Monitor21" Children="Controls">
+      <Property Name="Name">Monitor21</Property>
+      <Property Name="Size">195, 22</Property>
+      <Property Name="Location">668, 122</Property>
+      <Property Name="Font">Segoe UI, 9pt</Property>
+      <Property Name="BackColor">White</Property>
+      <Property Name="ForeColor">25, 40, 65</Property>
+      <Property Name="Text">INJECTION / submitted</Property>
+    </Object>
+    <Object Type="Vector.CANalyzer.Panels.Design.TextBoxControl, Vector.CANalyzer.Panels.CommonControls, Version=13.0.111.0, Culture=neutral, PublicKeyToken=null" Name="Monitor22" ControlName="Monitor22" Children="Controls">
+      <Property Name="Name">Monitor22</Property>
+      <Property Name="Size">190, 37</Property>
+      <Property Name="Location">458, 145</Property>
+      <Property Name="Font">Segoe UI, 21pt</Property>
+      <Property Name="BackColor">White</Property>
+      <Property Name="ForeColor">57, 100, 200</Property>
+      <Property Name="ReadOnlyControl">True</Property>
+      <Property Name="ValueDecimalPlaces">0</Property>
+      <Property Name="DisplayLabel">Hide</Property>
+      <Property Name="DescriptionText" />
+      <Property Name="DescriptionSize">0, 0</Property>
+      <Property Name="BoxBorderStyle">None</Property>
+      <Property Name="BoxBackColor">White</Property>
+      <Property Name="BoxForeColor">57, 100, 200</Property>
+      <Property Name="BoxFont">Segoe UI, 21pt</Property>
+      <Property Name="UsedValueTable">PhysicalValue</Property>
+      <Property Name="ValueDisplay">Decimal</Property>
+      <Property Name="SymbolConfiguration">5;16;FuzzIO;;;RxCount2;1;;;-1;;;</Property>
+    </Object>
+    <Object Type="Vector.CANalyzer.Panels.Design.TextBoxControl, Vector.CANalyzer.Panels.CommonControls, Version=13.0.111.0, Culture=neutral, PublicKeyToken=null" Name="Monitor23" ControlName="Monitor23" Children="Controls">
+      <Property Name="Name">Monitor23</Property>
+      <Property Name="Size">205, 37</Property>
+      <Property Name="Location">668, 145</Property>
+      <Property Name="Font">Segoe UI, 21pt</Property>
+      <Property Name="BackColor">White</Property>
+      <Property Name="ForeColor">57, 100, 200</Property>
+      <Property Name="ReadOnlyControl">True</Property>
+      <Property Name="ValueDecimalPlaces">0</Property>
+      <Property Name="DisplayLabel">Hide</Property>
+      <Property Name="DescriptionText" />
+      <Property Name="DescriptionSize">0, 0</Property>
+      <Property Name="BoxBorderStyle">None</Property>
+      <Property Name="BoxBackColor">White</Property>
+      <Property Name="BoxForeColor">57, 100, 200</Property>
+      <Property Name="BoxFont">Segoe UI, 21pt</Property>
+      <Property Name="UsedValueTable">PhysicalValue</Property>
+      <Property Name="ValueDisplay">Decimal</Property>
+      <Property Name="SymbolConfiguration">5;16;FuzzIO;;;TxSubmitted2;1;;;-1;;;</Property>
+    </Object>
+    <Object Type="Vector.CANalyzer.Panels.Design.StaticTextControl, Vector.CANalyzer.Panels.CommonControls, Version=13.0.111.0, Culture=neutral, PublicKeyToken=null" Name="Monitor24" ControlName="Monitor24" Children="Controls">
+      <Property Name="Name">Monitor24</Property>
+      <Property Name="Size">68, 22</Property>
+      <Property Name="Location">458, 192</Property>
+      <Property Name="Font">Segoe UI, 9pt</Property>
+      <Property Name="BackColor">White</Property>
+      <Property Name="ForeColor">25, 40, 65</Property>
+      <Property Name="Text">ERRORS</Property>
+    </Object>
+    <Object Type="Vector.CANalyzer.Panels.Design.TextBoxControl, Vector.CANalyzer.Panels.CommonControls, Version=13.0.111.0, Culture=neutral, PublicKeyToken=null" Name="Monitor25" ControlName="Monitor25" Children="Controls">
+      <Property Name="Name">Monitor25</Property>
+      <Property Name="Size">70, 26</Property>
+      <Property Name="Location">528, 189</Property>
+      <Property Name="Font">Segoe UI, 11pt</Property>
+      <Property Name="BackColor">White</Property>
+      <Property Name="ForeColor">25, 40, 65</Property>
+      <Property Name="ReadOnlyControl">True</Property>
+      <Property Name="ValueDecimalPlaces">0</Property>
+      <Property Name="DisplayLabel">Hide</Property>
+      <Property Name="DescriptionText" />
+      <Property Name="DescriptionSize">0, 0</Property>
+      <Property Name="BoxBorderStyle">None</Property>
+      <Property Name="BoxBackColor">White</Property>
+      <Property Name="BoxForeColor">25, 40, 65</Property>
+      <Property Name="BoxFont">Segoe UI, 11pt</Property>
+      <Property Name="UsedValueTable">PhysicalValue</Property>
+      <Property Name="ValueDisplay">Decimal</Property>
+      <Property Name="SymbolConfiguration">5;16;FuzzIO;;;ErrorFrame2;1;;;-1;;;</Property>
+    </Object>
+    <Object Type="Vector.CANalyzer.Panels.Design.TextBoxControl, Vector.CANalyzer.Panels.CommonControls, Version=13.0.111.0, Culture=neutral, PublicKeyToken=null" Name="Monitor26" ControlName="Monitor26" Children="Controls">
+      <Property Name="Name">Monitor26</Property>
+      <Property Name="Size">263, 26</Property>
+      <Property Name="Location">610, 189</Property>
+      <Property Name="Font">Segoe UI, 10pt</Property>
+      <Property Name="BackColor">White</Property>
+      <Property Name="ForeColor">25, 40, 65</Property>
+      <Property Name="ReadOnlyControl">True</Property>
+      <Property Name="ValueDecimalPlaces">0</Property>
+      <Property Name="DisplayLabel">Hide</Property>
+      <Property Name="DescriptionText" />
+      <Property Name="DescriptionSize">0, 0</Property>
+      <Property Name="BoxBorderStyle">None</Property>
+      <Property Name="BoxBackColor">White</Property>
+      <Property Name="BoxForeColor">25, 40, 65</Property>
+      <Property Name="BoxFont">Segoe UI, 10pt</Property>
+      <Property Name="UsedValueTable">PhysicalValue</Property>
+      <Property Name="ValueDisplay">Decimal</Property>
+      <Property Name="SymbolConfiguration">5;16;FuzzDashboard;;;BusHealth2;1;;;-1;;;</Property>
+    </Object>
+    <Object Type="Vector.CANalyzer.Panels.Design.StaticTextControl, Vector.CANalyzer.Panels.CommonControls, Version=13.0.111.0, Culture=neutral, PublicKeyToken=null" Name="Monitor27" ControlName="Monitor27" Children="Controls">
+      <Property Name="Name">Monitor27</Property>
+      <Property Name="Size">410, 20</Property>
+      <Property Name="Location">458, 224</Property>
+      <Property Name="Font">Segoe UI, 9pt</Property>
+      <Property Name="BackColor">White</Property>
+      <Property Name="ForeColor">25, 40, 65</Property>
+      <Property Name="Text">LATEST RECEIVED FRAME / sampled at 100 ms</Property>
+    </Object>
+    <Object Type="Vector.CANalyzer.Panels.Design.TextBoxControl, Vector.CANalyzer.Panels.CommonControls, Version=13.0.111.0, Culture=neutral, PublicKeyToken=null" Name="Monitor28" ControlName="Monitor28" Children="Controls">
+      <Property Name="Name">Monitor28</Property>
+      <Property Name="Size">415, 28</Property>
+      <Property Name="Location">458, 247</Property>
+      <Property Name="Font">Segoe UI, 10pt</Property>
+      <Property Name="BackColor">White</Property>
+      <Property Name="ForeColor">25, 40, 65</Property>
+      <Property Name="ReadOnlyControl">True</Property>
+      <Property Name="ValueDecimalPlaces">0</Property>
+      <Property Name="DisplayLabel">Hide</Property>
+      <Property Name="DescriptionText" />
+      <Property Name="DescriptionSize">0, 0</Property>
+      <Property Name="BoxBorderStyle">None</Property>
+      <Property Name="BoxBackColor">White</Property>
+      <Property Name="BoxForeColor">25, 40, 65</Property>
+      <Property Name="BoxFont">Segoe UI, 10pt</Property>
+      <Property Name="UsedValueTable">PhysicalValue</Property>
+      <Property Name="ValueDisplay">Decimal</Property>
+      <Property Name="SymbolConfiguration">5;16;FuzzDashboard;;;LastRx2;1;;;-1;;;</Property>
+    </Object>
+    <Object Type="Vector.CANalyzer.Panels.Design.StaticTextControl, Vector.CANalyzer.Panels.CommonControls, Version=13.0.111.0, Culture=neutral, PublicKeyToken=null" Name="Monitor29" ControlName="Monitor29" Children="Controls">
+      <Property Name="Name">Monitor29</Property>
+      <Property Name="Size">190, 30</Property>
+      <Property Name="Location">898, 82</Property>
+      <Property Name="Font">Segoe UI, 17pt</Property>
+      <Property Name="BackColor">White</Property>
+      <Property Name="ForeColor">135, 70, 180</Property>
+      <Property Name="Text">CAN3   I-CAN</Property>
+    </Object>
+    <Object Type="Vector.CANalyzer.Panels.Design.TextBoxControl, Vector.CANalyzer.Panels.CommonControls, Version=13.0.111.0, Culture=neutral, PublicKeyToken=null" Name="Monitor30" ControlName="Monitor30" Children="Controls">
+      <Property Name="Name">Monitor30</Property>
+      <Property Name="Size">210, 25</Property>
+      <Property Name="Location">1103, 85</Property>
+      <Property Name="Font">Segoe UI, 10pt</Property>
+      <Property Name="BackColor">White</Property>
+      <Property Name="ForeColor">135, 70, 180</Property>
+      <Property Name="ReadOnlyControl">True</Property>
+      <Property Name="ValueDecimalPlaces">0</Property>
+      <Property Name="DisplayLabel">Hide</Property>
+      <Property Name="DescriptionText" />
+      <Property Name="DescriptionSize">0, 0</Property>
+      <Property Name="BoxBorderStyle">None</Property>
+      <Property Name="BoxBackColor">White</Property>
+      <Property Name="BoxForeColor">135, 70, 180</Property>
+      <Property Name="BoxFont">Segoe UI, 10pt</Property>
+      <Property Name="UsedValueTable">PhysicalValue</Property>
+      <Property Name="ValueDisplay">Decimal</Property>
+      <Property Name="SymbolConfiguration">5;16;FuzzDashboard;;;RxState3;1;;;-1;;;</Property>
+    </Object>
+    <Object Type="Vector.CANalyzer.Panels.Design.StaticTextControl, Vector.CANalyzer.Panels.CommonControls, Version=13.0.111.0, Culture=neutral, PublicKeyToken=null" Name="Monitor31" ControlName="Monitor31" Children="Controls">
+      <Property Name="Name">Monitor31</Property>
+      <Property Name="Size">185, 22</Property>
+      <Property Name="Location">898, 122</Property>
+      <Property Name="Font">Segoe UI, 9pt</Property>
+      <Property Name="BackColor">White</Property>
+      <Property Name="ForeColor">25, 40, 65</Property>
+      <Property Name="Text">RECEIVED / node Rx</Property>
+    </Object>
+    <Object Type="Vector.CANalyzer.Panels.Design.StaticTextControl, Vector.CANalyzer.Panels.CommonControls, Version=13.0.111.0, Culture=neutral, PublicKeyToken=null" Name="Monitor32" ControlName="Monitor32" Children="Controls">
+      <Property Name="Name">Monitor32</Property>
+      <Property Name="Size">195, 22</Property>
+      <Property Name="Location">1108, 122</Property>
+      <Property Name="Font">Segoe UI, 9pt</Property>
+      <Property Name="BackColor">White</Property>
+      <Property Name="ForeColor">25, 40, 65</Property>
+      <Property Name="Text">INJECTION / submitted</Property>
+    </Object>
+    <Object Type="Vector.CANalyzer.Panels.Design.TextBoxControl, Vector.CANalyzer.Panels.CommonControls, Version=13.0.111.0, Culture=neutral, PublicKeyToken=null" Name="Monitor33" ControlName="Monitor33" Children="Controls">
+      <Property Name="Name">Monitor33</Property>
+      <Property Name="Size">190, 37</Property>
+      <Property Name="Location">898, 145</Property>
+      <Property Name="Font">Segoe UI, 21pt</Property>
+      <Property Name="BackColor">White</Property>
+      <Property Name="ForeColor">135, 70, 180</Property>
+      <Property Name="ReadOnlyControl">True</Property>
+      <Property Name="ValueDecimalPlaces">0</Property>
+      <Property Name="DisplayLabel">Hide</Property>
+      <Property Name="DescriptionText" />
+      <Property Name="DescriptionSize">0, 0</Property>
+      <Property Name="BoxBorderStyle">None</Property>
+      <Property Name="BoxBackColor">White</Property>
+      <Property Name="BoxForeColor">135, 70, 180</Property>
+      <Property Name="BoxFont">Segoe UI, 21pt</Property>
+      <Property Name="UsedValueTable">PhysicalValue</Property>
+      <Property Name="ValueDisplay">Decimal</Property>
+      <Property Name="SymbolConfiguration">5;16;FuzzIO;;;RxCount3;1;;;-1;;;</Property>
+    </Object>
+    <Object Type="Vector.CANalyzer.Panels.Design.TextBoxControl, Vector.CANalyzer.Panels.CommonControls, Version=13.0.111.0, Culture=neutral, PublicKeyToken=null" Name="Monitor34" ControlName="Monitor34" Children="Controls">
+      <Property Name="Name">Monitor34</Property>
+      <Property Name="Size">205, 37</Property>
+      <Property Name="Location">1108, 145</Property>
+      <Property Name="Font">Segoe UI, 21pt</Property>
+      <Property Name="BackColor">White</Property>
+      <Property Name="ForeColor">135, 70, 180</Property>
+      <Property Name="ReadOnlyControl">True</Property>
+      <Property Name="ValueDecimalPlaces">0</Property>
+      <Property Name="DisplayLabel">Hide</Property>
+      <Property Name="DescriptionText" />
+      <Property Name="DescriptionSize">0, 0</Property>
+      <Property Name="BoxBorderStyle">None</Property>
+      <Property Name="BoxBackColor">White</Property>
+      <Property Name="BoxForeColor">135, 70, 180</Property>
+      <Property Name="BoxFont">Segoe UI, 21pt</Property>
+      <Property Name="UsedValueTable">PhysicalValue</Property>
+      <Property Name="ValueDisplay">Decimal</Property>
+      <Property Name="SymbolConfiguration">5;16;FuzzIO;;;TxSubmitted3;1;;;-1;;;</Property>
+    </Object>
+    <Object Type="Vector.CANalyzer.Panels.Design.StaticTextControl, Vector.CANalyzer.Panels.CommonControls, Version=13.0.111.0, Culture=neutral, PublicKeyToken=null" Name="Monitor35" ControlName="Monitor35" Children="Controls">
+      <Property Name="Name">Monitor35</Property>
+      <Property Name="Size">68, 22</Property>
+      <Property Name="Location">898, 192</Property>
+      <Property Name="Font">Segoe UI, 9pt</Property>
+      <Property Name="BackColor">White</Property>
+      <Property Name="ForeColor">25, 40, 65</Property>
+      <Property Name="Text">ERRORS</Property>
+    </Object>
+    <Object Type="Vector.CANalyzer.Panels.Design.TextBoxControl, Vector.CANalyzer.Panels.CommonControls, Version=13.0.111.0, Culture=neutral, PublicKeyToken=null" Name="Monitor36" ControlName="Monitor36" Children="Controls">
+      <Property Name="Name">Monitor36</Property>
+      <Property Name="Size">70, 26</Property>
+      <Property Name="Location">968, 189</Property>
+      <Property Name="Font">Segoe UI, 11pt</Property>
+      <Property Name="BackColor">White</Property>
+      <Property Name="ForeColor">25, 40, 65</Property>
+      <Property Name="ReadOnlyControl">True</Property>
+      <Property Name="ValueDecimalPlaces">0</Property>
+      <Property Name="DisplayLabel">Hide</Property>
+      <Property Name="DescriptionText" />
+      <Property Name="DescriptionSize">0, 0</Property>
+      <Property Name="BoxBorderStyle">None</Property>
+      <Property Name="BoxBackColor">White</Property>
+      <Property Name="BoxForeColor">25, 40, 65</Property>
+      <Property Name="BoxFont">Segoe UI, 11pt</Property>
+      <Property Name="UsedValueTable">PhysicalValue</Property>
+      <Property Name="ValueDisplay">Decimal</Property>
+      <Property Name="SymbolConfiguration">5;16;FuzzIO;;;ErrorFrame3;1;;;-1;;;</Property>
+    </Object>
+    <Object Type="Vector.CANalyzer.Panels.Design.TextBoxControl, Vector.CANalyzer.Panels.CommonControls, Version=13.0.111.0, Culture=neutral, PublicKeyToken=null" Name="Monitor37" ControlName="Monitor37" Children="Controls">
+      <Property Name="Name">Monitor37</Property>
+      <Property Name="Size">263, 26</Property>
+      <Property Name="Location">1050, 189</Property>
+      <Property Name="Font">Segoe UI, 10pt</Property>
+      <Property Name="BackColor">White</Property>
+      <Property Name="ForeColor">25, 40, 65</Property>
+      <Property Name="ReadOnlyControl">True</Property>
+      <Property Name="ValueDecimalPlaces">0</Property>
+      <Property Name="DisplayLabel">Hide</Property>
+      <Property Name="DescriptionText" />
+      <Property Name="DescriptionSize">0, 0</Property>
+      <Property Name="BoxBorderStyle">None</Property>
+      <Property Name="BoxBackColor">White</Property>
+      <Property Name="BoxForeColor">25, 40, 65</Property>
+      <Property Name="BoxFont">Segoe UI, 10pt</Property>
+      <Property Name="UsedValueTable">PhysicalValue</Property>
+      <Property Name="ValueDisplay">Decimal</Property>
+      <Property Name="SymbolConfiguration">5;16;FuzzDashboard;;;BusHealth3;1;;;-1;;;</Property>
+    </Object>
+    <Object Type="Vector.CANalyzer.Panels.Design.StaticTextControl, Vector.CANalyzer.Panels.CommonControls, Version=13.0.111.0, Culture=neutral, PublicKeyToken=null" Name="Monitor38" ControlName="Monitor38" Children="Controls">
+      <Property Name="Name">Monitor38</Property>
+      <Property Name="Size">410, 20</Property>
+      <Property Name="Location">898, 224</Property>
+      <Property Name="Font">Segoe UI, 9pt</Property>
+      <Property Name="BackColor">White</Property>
+      <Property Name="ForeColor">25, 40, 65</Property>
+      <Property Name="Text">LATEST RECEIVED FRAME / sampled at 100 ms</Property>
+    </Object>
+    <Object Type="Vector.CANalyzer.Panels.Design.TextBoxControl, Vector.CANalyzer.Panels.CommonControls, Version=13.0.111.0, Culture=neutral, PublicKeyToken=null" Name="Monitor39" ControlName="Monitor39" Children="Controls">
+      <Property Name="Name">Monitor39</Property>
+      <Property Name="Size">415, 28</Property>
+      <Property Name="Location">898, 247</Property>
+      <Property Name="Font">Segoe UI, 10pt</Property>
+      <Property Name="BackColor">White</Property>
+      <Property Name="ForeColor">25, 40, 65</Property>
+      <Property Name="ReadOnlyControl">True</Property>
+      <Property Name="ValueDecimalPlaces">0</Property>
+      <Property Name="DisplayLabel">Hide</Property>
+      <Property Name="DescriptionText" />
+      <Property Name="DescriptionSize">0, 0</Property>
+      <Property Name="BoxBorderStyle">None</Property>
+      <Property Name="BoxBackColor">White</Property>
+      <Property Name="BoxForeColor">25, 40, 65</Property>
+      <Property Name="BoxFont">Segoe UI, 10pt</Property>
+      <Property Name="UsedValueTable">PhysicalValue</Property>
+      <Property Name="ValueDisplay">Decimal</Property>
+      <Property Name="SymbolConfiguration">5;16;FuzzDashboard;;;LastRx3;1;;;-1;;;</Property>
+    </Object>
+    <Object Type="Vector.CANalyzer.Panels.Design.StaticTextControl, Vector.CANalyzer.Panels.CommonControls, Version=13.0.111.0, Culture=neutral, PublicKeyToken=null" Name="Monitor40" ControlName="Monitor40" Children="Controls">
+      <Property Name="Name">Monitor40</Property>
+      <Property Name="Size">1300, 23</Property>
+      <Property Name="Location">18, 290</Property>
+      <Property Name="Font">Segoe UI, 9pt</Property>
+      <Property Name="BackColor">White</Property>
+      <Property Name="ForeColor">25, 40, 65</Property>
+      <Property Name="Text">Native Trace below: channel / direction / ID / data.  Submitted is not physical Tx confirmation.  Node Rx is diagnostic; BLF Rx is the analysis source.</Property>
+    </Object>
+    <Property Name="Name">Panel</Property>
+    <Property Name="Text">FUZZLAB Monitor</Property>
+    <Property Name="Size">1340, 320</Property>
+    <Property Name="Location">0, 0</Property>
+    <Property Name="BackColor">White</Property>
+  </Object>
+</Panel>

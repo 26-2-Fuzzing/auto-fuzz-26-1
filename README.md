@@ -1,6 +1,12 @@
 # Auto-Fuzz
 > Real-vehicle ECU fuzzing framework with multi-monitoring and automated recovery
 
+## CANoe paired 0x366 mutations
+
+Windows CANoe와 WSL에서 mutation 방식을 선택해 CAN2로 송신하고 CAN1/2/3을 수집하는 절차는
+[CANoe paired 실행 가이드](pi_can_lab/CANOE_PAIRED.md)를 참고하세요.
+설치 의존성은 `pi_can_lab/requirements-canoe.txt`에 있습니다.
+
 ## 🚀 개발 환경 세팅
 ### 1. 요구사항
 * 운영체제 : Linux (Ubuntu 20.04+ 권장) 또는 WSL2

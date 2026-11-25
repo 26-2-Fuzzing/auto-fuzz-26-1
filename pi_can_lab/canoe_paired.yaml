@@ -1,0 +1,19 @@
+# Relative to this file. Each operator passes their own CANoe .cfg path on the CLI.
+dbc: ../A5.dbc
+
+target:
+  id: 0x366
+  source_bus: B_CAN
+  baseline_payload: "00 00 00 00 20 00 00 F0"
+
+mutation:
+  method: signal_single
+  max_cases: 10
+  random_seed: 366
+  undefined_max_bits: 2
+  duration_seconds: 1.0
+  interval_ms: 50.0
+
+transmit:
+  restore_original: true
+  restore_count: 1

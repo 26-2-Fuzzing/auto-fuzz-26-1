@@ -1,0 +1,493 @@
+/*@!Encoding:1252*/
+/*
+ * Raw Classic CAN transport. Attach this node to CAN1, CAN2 and CAN3.
+ * No DBC, mutation, decoding or anomaly detection. Transmission requires an explicit host plan.
+ * One writer must fill the input fields and write TxRequestSeq LAST.
+ * Wait for TxDoneSeq before editing the next request. Sequence numbers must
+ * increase within one measurement and fit in a positive signed 32-bit value.
+ * A new measurement resets both sequence fields to zero (idle sentinel).
+ *
+ * TxResult: 0 idle; 1 output() submitted (NOT physical Tx confirmation).
+ * -1 invalid/non-positive sequence; -2 duplicate or out-of-order sequence;
+ * -3 invalid channel; -4 invalid extended flag; -5 invalid identifier;
+ * -6 invalid DLC; -7 byte outside 0..255; -8 cannot read data array;
+ * -9 channel has a latched bus-off; -10 measurement not ready.
+ * Every positive new sequence is consumed, including rejected requests.
+ * BusOff flags latch until the measurement restarts; no automatic recovery.
+ * TxResult is never overwritten by a later bus event for a completed request.
+ */
+
+variables
+{
+  message * txFrame;
+  msTimer dashboardHeartbeat;
+  msTimer scheduleTick;
+  long scheduleActive = 0;
+  long scheduleSeq = 0;
+  long scheduleCount = 0;
+  long scheduleChannel = 0;
+  long scheduleId = 0;
+  long scheduleExtended = 0;
+  long scheduleDlc = 0;
+  long scheduleDuration = 0;
+  long scheduleIndex = 0;
+  long scheduleData[1600];
+  long scheduleOffsets[200];
+  int64 scheduleStart;
+  int64 scheduleLeaseTime;
+  long scheduleLease;
+
+  long dashboardRx[4][15];
+  long dashboardCopy[15];
+  long dashboardLastPublished[4];
+
+  long ready = 0;
+  long lastSequence = 0;
+  long blockedChannel[4];
+}
+
+void completeRequest(long sequence, long result)
+{
+  @sysvar::FuzzIO::TxResult = result;
+  // Commit marker: write only after all result/counter updates.
+  @sysvar::FuzzIO::TxDoneSeq = sequence;
+}
+
+// Native panel shows observed samples only. Trace/BLF retains complete frames.
+void publishNativeView()
+{
+  long ch;
+  long i;
+  long age;
+  char name[32];
+  char line[160];
+  char byteText[8];
+  char source[96];
+  for (ch=1; ch<=3; ch++)
+  {
+    snprintf(name, elcount(name), "LastRx%d", ch);
+    if (dashboardRx[ch][0] == 0)
+      sysSetVariableString("FuzzDashboard", name, "No Rx observed");
+    else if (dashboardRx[ch][0] != dashboardLastPublished[ch])
+    {
+      snprintf(line, elcount(line), "0x%X  DLC %d |", dashboardRx[ch][1], dashboardRx[ch][2]);
+      if (dashboardRx[ch][4]) strncat(line, " RTR", elcount(line));
+      else
+        for (i=0; i<dashboardRx[ch][2] && i<8; i++)
+        {
+          snprintf(byteText, elcount(byteText), " %02X", dashboardRx[ch][6+i]);
+          strncat(line, byteText, elcount(line));
+        }
+      if (dashboardRx[ch][14]) strncat(line, " [FD: first 8B]", elcount(line));
+      sysSetVariableString("FuzzDashboard", name, line);
+    }
+    dashboardLastPublished[ch] = dashboardRx[ch][0];
+    snprintf(name, elcount(name), "RxState%d", ch);
+    age = timeNowInt64()/1000000-dashboardRx[ch][5];
+    if (!ready) sysSetVariableString("FuzzDashboard", name, "STOPPED");
+    else if (dashboardRx[ch][0] == 0) sysSetVariableString("FuzzDashboard", name, "WAITING FOR RX");
+    else if (age <= 1000) sysSetVariableString("FuzzDashboard", name, "RECEIVING");
+    else sysSetVariableString("FuzzDashboard", name, "RX QUIET > 1s");
+    snprintf(name, elcount(name), "BusHealth%d", ch);
+    if (blockedChannel[ch]) sysSetVariableString("FuzzDashboard", name, "BUS-OFF / LATCHED");
+    else sysSetVariableString("FuzzDashboard", name, "No bus-off observed");
+  }
+  if (scheduleActive && scheduleCount > 0)
+  {
+    snprintf(source, elcount(source), "CAN%d  ID 0x%X | %d / %d submitted",
+             scheduleChannel, scheduleId, scheduleIndex, scheduleCount);
+    if (scheduleIndex >= scheduleCount) strncat(source, " | observing", elcount(source));
+    sysSetVariableString("FuzzDashboard", "SourceText", source);
+  }
+  else if (scheduleActive) sysSetVariableString("FuzzDashboard", "SourceText", "OBSERVING / no injection");
+  else sysSetVariableString("FuzzDashboard", "SourceText", "No active injection");
+}
+
+// Publish one atomic array per channel; never publish Tx as an Rx response.
+void publishDashboardRx()
+{
+  long ch;
+  long i;
+  char name[32];
+  for (ch=1; ch<=3; ch++)
+  {
+    for (i=0; i<15; i++) dashboardCopy[i] = dashboardRx[ch][i];
+    snprintf(name, elcount(name), "RxSnapshot%d", ch);
+    sysSetVariableLongArray("FuzzDashboard", name, dashboardCopy, 15);
+  }
+}
+
+on preStart
+{
+  long ch;
+  long i;
+  for (ch=1; ch<=3; ch++) dashboardLastPublished[ch] = 0;
+  sysSetVariableString("FuzzDashboard", "PhaseText", "READY / awaiting experiment");
+  for (ch=1; ch<=3; ch++)
+    for (i=0; i<15; i++) dashboardRx[ch][i] = 0;
+  publishDashboardRx();
+  ready = 0;
+  scheduleActive = 0;
+  scheduleSeq = 0;
+  @sysvar::FuzzSchedule::RequestSeq = 0;
+  @sysvar::FuzzSchedule::DoneSeq = 0;
+  @sysvar::FuzzSchedule::CancelSeq = 0;
+  @sysvar::FuzzSchedule::Lease = 0;
+  @sysvar::FuzzSchedule::Result = 0;
+  @sysvar::FuzzSchedule::Submitted = 0;
+  @sysvar::FuzzSchedule::StartNs = 0;
+  @sysvar::FuzzSchedule::EndNs = 0;
+  @sysvar::FuzzDashboard::MarkerRequestSeq = 0;
+  @sysvar::FuzzDashboard::MarkerDoneSeq = 0;
+  @sysvar::FuzzDashboard::MarkerTimeNs = 0;
+  @sysvar::FuzzDashboard::Heartbeat = 0;
+  @sysvar::FuzzDashboard::CurrentTimeNs = 0;
+  lastSequence = 0;
+  blockedChannel[1] = 0;
+  blockedChannel[2] = 0;
+  blockedChannel[3] = 0;
+  @sysvar::FuzzIO::TxRequestSeq = 0;
+  @sysvar::FuzzIO::TxDoneSeq = 0;
+  @sysvar::FuzzIO::TxResult = 0;
+  @sysvar::FuzzIO::RxCount1 = 0;
+  @sysvar::FuzzIO::RxCount2 = 0;
+  @sysvar::FuzzIO::RxCount3 = 0;
+  @sysvar::FuzzIO::TxSubmitted1 = 0;
+  @sysvar::FuzzIO::TxSubmitted2 = 0;
+  @sysvar::FuzzIO::TxSubmitted3 = 0;
+  @sysvar::FuzzIO::BusOff1 = 0;
+  @sysvar::FuzzIO::BusOff2 = 0;
+  @sysvar::FuzzIO::BusOff3 = 0;
+  @sysvar::FuzzIO::ErrorFrame1 = 0;
+  @sysvar::FuzzIO::ErrorFrame2 = 0;
+  @sysvar::FuzzIO::ErrorFrame3 = 0;
+}
+
+on start
+{
+  // The preStart reset discards any retained request without transmitting it.
+  lastSequence = 0;
+  ready = 1;
+  openPanel("FUZZLAB Monitor");
+  sysSetVariableString("FuzzDashboard", "MeasurementState", "RUNNING");
+  publishNativeView();
+  write("FUZZLAB | measurement started | CAN1=P-CAN CAN2=B-CAN CAN3=I-CAN");
+  setTimer(dashboardHeartbeat, 100);
+}
+
+on stopMeasurement
+{
+  cancelTimer(dashboardHeartbeat);
+  cancelTimer(scheduleTick);
+  scheduleActive = 0;
+  ready = 0;
+  sysSetVariableString("FuzzDashboard", "MeasurementState", "STOPPED / values retained");
+  publishNativeView();
+  write("FUZZLAB | measurement stopped | inspect Trace or saved BLF/ASC");
+}
+
+on sysvar_update FuzzIO::TxRequestSeq
+{
+  long sequence;
+  long channel;
+  long identifier;
+  long extended;
+  long dlc;
+  long dataBytes[8];
+  long readResult;
+  long i;
+
+  // Snapshot all fields before validation or output. This is a single-slot
+  // protocol; the Python client must not edit fields before the commit reply.
+  sequence = @sysvar::FuzzIO::TxRequestSeq;
+  channel = @sysvar::FuzzIO::TxChannel;
+  identifier = @sysvar::FuzzIO::TxId;
+  extended = @sysvar::FuzzIO::TxExtended;
+  dlc = @sysvar::FuzzIO::TxDlc;
+  // String-name overload avoids parser ambiguity with a typed array symbol.
+  readResult = sysGetVariableLongArray("FuzzIO", "TxData",
+                                      dataBytes, elcount(dataBytes));
+
+  // A queued initialization update is an idle reset, never a send request.
+  if (sequence == 0 && lastSequence == 0)
+  {
+    return;
+  }
+
+  if (!ready || scheduleActive)
+  {
+    completeRequest(sequence, -10);
+    return;
+  }
+  if (sequence <= 0)
+  {
+    completeRequest(sequence, -1);
+    return;
+  }
+  if (sequence <= lastSequence)
+  {
+    completeRequest(sequence, -2);
+    return;
+  }
+  lastSequence = sequence;
+  if (channel < 1 || channel > 3)
+  {
+    completeRequest(sequence, -3);
+    return;
+  }
+  if (extended != 0 && extended != 1)
+  {
+    completeRequest(sequence, -4);
+    return;
+  }
+  if (identifier < 0 || identifier > 0x1FFFFFFF ||
+      (extended == 0 && identifier > 0x7FF))
+  {
+    completeRequest(sequence, -5);
+    return;
+  }
+  if (dlc < 0 || dlc > 8)
+  {
+    completeRequest(sequence, -6);
+    return;
+  }
+  if (readResult != 0)
+  {
+    completeRequest(sequence, -8);
+    return;
+  }
+  // Validate the complete fixed-size input, including unused padding bytes.
+  for (i = 0; i < elcount(dataBytes); i++)
+  {
+    if (dataBytes[i] < 0 || dataBytes[i] > 255)
+    {
+      completeRequest(sequence, -7);
+      return;
+    }
+  }
+  if (blockedChannel[channel])
+  {
+    completeRequest(sequence, -9);
+    return;
+  }
+
+  txFrame.CAN = channel;
+  txFrame.ID = identifier;
+  if (extended == 1)
+  {
+    txFrame.ID = mkExtId(identifier);
+  }
+  txFrame.FDF = 0;
+  txFrame.BRS = 0;
+  txFrame.RTR = 0;
+  txFrame.DLC = dlc;
+  for (i = 0; i < 8; i++)
+  {
+    txFrame.byte(i) = dataBytes[i];
+  }
+  output(txFrame);
+
+  switch (channel)
+  {
+    case 1: @sysvar::FuzzIO::TxSubmitted1++; break;
+    case 2: @sysvar::FuzzIO::TxSubmitted2++; break;
+    case 3: @sysvar::FuzzIO::TxSubmitted3++; break;
+  }
+  completeRequest(sequence, 1);
+}
+
+on message *
+{
+  long ch;
+  long i;
+  if (this.dir != Rx || this.CAN < 1 || this.CAN > 3) return;
+  ch = this.CAN;
+  switch (ch)
+  {
+    case 1: @sysvar::FuzzIO::RxCount1++; break;
+    case 2: @sysvar::FuzzIO::RxCount2++; break;
+    case 3: @sysvar::FuzzIO::RxCount3++; break;
+  }
+  dashboardRx[ch][0]++;
+  dashboardRx[ch][1] = this.ID & 0x1FFFFFFF;
+  dashboardRx[ch][2] = this.DLC;
+  dashboardRx[ch][3] = isExtId(this.ID);
+  dashboardRx[ch][4] = this.RTR;
+  dashboardRx[ch][5] = timeNowInt64()/1000000;
+  for (i=0; i<8; i++)
+  {
+    dashboardRx[ch][6+i] = 0;
+    if (!this.RTR && i<this.DLC) dashboardRx[ch][6+i] = this.byte(i);
+  }
+  dashboardRx[ch][14] = this.FDF;
+  // Observation only. No output(this), no synthetic response.
+}
+
+on busOff
+{
+  switch (this.CAN)
+  {
+    case 1:
+      blockedChannel[1] = 1;
+      @sysvar::FuzzIO::BusOff1 = 1;
+      break;
+    case 2:
+      blockedChannel[2] = 1;
+      @sysvar::FuzzIO::BusOff2 = 1;
+      break;
+    case 3:
+      blockedChannel[3] = 1;
+      @sysvar::FuzzIO::BusOff3 = 1;
+      break;
+  }
+}
+
+on errorFrame
+{
+  // CANoe delivers error, overload and protocol-exception events here.
+  switch (this.CAN)
+  {
+    case 1: @sysvar::FuzzIO::ErrorFrame1++; break;
+    case 2: @sysvar::FuzzIO::ErrorFrame2++; break;
+    case 3: @sysvar::FuzzIO::ErrorFrame3++; break;
+  }
+}
+
+// Measurement-clock evidence. These events do not place frames on the CAN bus.
+on timer dashboardHeartbeat
+{
+  publishDashboardRx();
+  publishNativeView();
+  @sysvar::FuzzDashboard::CurrentTimeNs = timeNowInt64();
+  @sysvar::FuzzDashboard::Heartbeat++;
+  setTimer(dashboardHeartbeat, 100);
+}
+
+on sysvar_update FuzzDashboard::MarkerRequestSeq
+{
+  long request;
+  request = @sysvar::FuzzDashboard::MarkerRequestSeq;
+  if (!ready || request <= @sysvar::FuzzDashboard::MarkerDoneSeq) return;
+  @sysvar::FuzzDashboard::MarkerTimeNs = timeNowInt64();
+  @sysvar::FuzzDashboard::MarkerDoneSeq = request;
+}
+
+// The Windows client uploads a bounded plan; this timer owns pacing.
+// Host lease expiry and cancellation stop future output without retries.
+void finishSchedule(long result)
+{
+  cancelTimer(scheduleTick);
+  scheduleActive = 0;
+  @sysvar::FuzzSchedule::EndNs = timeNowInt64();
+  @sysvar::FuzzSchedule::Result = result;
+  @sysvar::FuzzSchedule::DoneSeq = scheduleSeq;
+  publishNativeView();
+  write("FUZZLAB | phase complete | request=%d result=%d submitted=%d", scheduleSeq, result, scheduleIndex);
+}
+on sysvar_update FuzzSchedule::Lease
+{
+  if (scheduleActive)
+  {
+    scheduleLease = @sysvar::FuzzSchedule::Lease;
+    scheduleLeaseTime = timeNowInt64();
+  }
+}
+on sysvar_update FuzzSchedule::CancelSeq
+{
+  if (scheduleActive && @sysvar::FuzzSchedule::CancelSeq == scheduleSeq)
+    finishSchedule(-20);
+}
+on sysvar_update FuzzSchedule::RequestSeq
+{
+  long request;
+  long i;
+  request = @sysvar::FuzzSchedule::RequestSeq;
+  if (request <= 0 || request <= scheduleSeq) return;
+  if (scheduleActive) { finishSchedule(-21); return; }
+  scheduleSeq = request;
+  scheduleCount = @sysvar::FuzzSchedule::Count;
+  scheduleChannel = @sysvar::FuzzSchedule::Channel;
+  scheduleId = @sysvar::FuzzSchedule::Id;
+  scheduleExtended = @sysvar::FuzzSchedule::Extended;
+  scheduleDlc = @sysvar::FuzzSchedule::Dlc;
+  scheduleDuration = @sysvar::FuzzSchedule::DurationMs;
+  scheduleIndex = 0;
+  @sysvar::FuzzSchedule::Submitted = 0;
+  @sysvar::FuzzSchedule::Result = 0;
+  @sysvar::FuzzSchedule::StartNs = 0;
+  @sysvar::FuzzSchedule::EndNs = 0;
+  if (!ready || @sysvar::FuzzIO::TxRequestSeq != @sysvar::FuzzIO::TxDoneSeq)
+  { finishSchedule(-10); return; }
+  if (scheduleCount < 0 || scheduleCount > 200 || scheduleChannel < 1 || scheduleChannel > 3 ||
+      scheduleDlc < 0 || scheduleDlc > 8 || scheduleDuration < 1 || scheduleDuration > 120000 ||
+      scheduleId < 0 || scheduleId > 0x1FFFFFFF ||
+      (scheduleExtended != 0 && scheduleExtended != 1) ||
+      (scheduleExtended == 0 && scheduleId > 0x7FF))
+  { finishSchedule(-22); return; }
+  if (sysGetVariableLongArray("FuzzSchedule", "Data", scheduleData, 1600) != 0 ||
+      sysGetVariableLongArray("FuzzSchedule", "OffsetsMs", scheduleOffsets, 200) != 0)
+  { finishSchedule(-8); return; }
+  for (i=0; i<scheduleCount*8; i++)
+    if (scheduleData[i] < 0 || scheduleData[i] > 255) { finishSchedule(-7); return; }
+  for (i=0; i<scheduleCount; i++)
+    if (scheduleOffsets[i] < 0 || scheduleOffsets[i] >= scheduleDuration ||
+        (i > 0 && scheduleOffsets[i]-scheduleOffsets[i-1] < 50))
+    { finishSchedule(-23); return; }
+  scheduleStart = timeNowInt64();
+  scheduleLeaseTime = scheduleStart;
+  scheduleLease = @sysvar::FuzzSchedule::Lease;
+  @sysvar::FuzzSchedule::StartNs = scheduleStart;
+  scheduleActive = 1;
+  publishNativeView();
+  write("FUZZLAB | phase start | request=%d CAN%d ID=0x%X frames=%d", scheduleSeq, scheduleChannel, scheduleId, scheduleCount);
+  setTimer(scheduleTick,1);
+}
+on timer scheduleTick
+{
+  long elapsed;
+  long delayMs;
+  long untilFrame;
+  long i;
+  if (!scheduleActive) return;
+  if (timeNowInt64()-scheduleLeaseTime > 2000000000)
+  { finishSchedule(-24); return; }
+  if (blockedChannel[1] || blockedChannel[2] || blockedChannel[3])
+  { finishSchedule(-9); return; }
+  elapsed = (timeNowInt64()-scheduleStart)/1000000;
+  if (elapsed >= scheduleDuration)
+  { finishSchedule(scheduleIndex == scheduleCount ? 1 : -25); return; }
+  if (scheduleIndex < scheduleCount && elapsed >= scheduleOffsets[scheduleIndex]+1)
+  {
+    if (elapsed-scheduleOffsets[scheduleIndex]-1 > 10)
+    { finishSchedule(-26); return; }
+    txFrame.CAN = scheduleChannel;
+    txFrame.ID = scheduleId;
+    if (scheduleExtended) txFrame.ID = mkExtId(scheduleId);
+    txFrame.FDF = 0; txFrame.BRS = 0; txFrame.RTR = 0; txFrame.DLC = scheduleDlc;
+    for (i=0; i<8; i++) txFrame.byte(i) = scheduleData[scheduleIndex*8+i];
+    output(txFrame);
+    scheduleIndex++;
+    @sysvar::FuzzSchedule::Submitted = scheduleIndex;
+    switch (scheduleChannel)
+    {
+      case 1: @sysvar::FuzzIO::TxSubmitted1++; break;
+      case 2: @sysvar::FuzzIO::TxSubmitted2++; break;
+      case 3: @sysvar::FuzzIO::TxSubmitted3++; break;
+    }
+  }
+  delayMs = scheduleDuration-elapsed;
+  if (delayMs > 100) delayMs = 100;
+  if (scheduleIndex < scheduleCount)
+  {
+    untilFrame = scheduleOffsets[scheduleIndex]+1-elapsed;
+    if (untilFrame < delayMs) delayMs = untilFrame;
+  }
+  if (delayMs < 1) delayMs = 1;
+  setTimer(scheduleTick,delayMs);
+}
+
+// Restore the observer panel when the website attaches to a running measurement.
+on sysvar_update FuzzDashboard::ShowMonitor
+{
+  if (ready) openPanel("FUZZLAB Monitor");
+}

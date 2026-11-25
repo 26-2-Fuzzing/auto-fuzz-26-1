@@ -1,0 +1,618 @@
+{
+  "source": "Frozen CANoe signal_single catalogue for the bundled A5.dbc",
+  "baseline_payload_hex": "00000000200000F0",
+  "portable_catalog_sha256": "fc2b941027312b3239ca2f999716d5797b48dd1adbf60b62c72d9c237a8f8c37",
+  "dbc_sha256": "6a5452ebd0fcc7cf2bafaea733d7299bf3d7ea12f8b51debc47b68368d9eb840",
+  "cases": [
+    {
+      "number": 1,
+      "name": "BM_Autobahn_RAW_1",
+      "payload_hex": "00000000240000F0"
+    },
+    {
+      "number": 2,
+      "name": "BM_Crash_RAW_1",
+      "payload_hex": "00000100200000F0"
+    },
+    {
+      "number": 3,
+      "name": "BM_DWA_Alarm_RAW_1",
+      "payload_hex": "00800000200000F0"
+    },
+    {
+      "number": 4,
+      "name": "BM_DWA_ein_RAW_1",
+      "payload_hex": "00400000200000F0"
+    },
+    {
+      "number": 5,
+      "name": "BM_GDO_RAW_1",
+      "payload_hex": "00000800200000F0"
+    },
+    {
+      "number": 6,
+      "name": "BM_HD_Oeffnung_angelernt_RAW_1",
+      "payload_hex": "00000000220000F0"
+    },
+    {
+      "number": 7,
+      "name": "BM_NBA_Status_RAW_1",
+      "payload_hex": "00000040200000F0"
+    },
+    {
+      "number": 8,
+      "name": "BM_NBA_Status_RAW_2",
+      "payload_hex": "00000080200000F0"
+    },
+    {
+      "number": 9,
+      "name": "BM_NBA_Status_RAW_3",
+      "payload_hex": "000000C0200000F0"
+    },
+    {
+      "number": 10,
+      "name": "BM_NBA_n_codiert_n_aktiv_RAW_1",
+      "payload_hex": "00000020200000F0"
+    },
+    {
+      "number": 11,
+      "name": "BM_Not_Bremsung_RAW_1",
+      "payload_hex": "00000400200000F0"
+    },
+    {
+      "number": 12,
+      "name": "BM_Panik_RAW_1",
+      "payload_hex": "00000200200000F0"
+    },
+    {
+      "number": 13,
+      "name": "BM_PiloPa_RAW_1",
+      "payload_hex": "00000000201000F0"
+    },
+    {
+      "number": 14,
+      "name": "BM_Recas_RAW_1",
+      "payload_hex": "00000000300000F0"
+    },
+    {
+      "number": 15,
+      "name": "BM_Rollenmodus_Blinken_RAW_1",
+      "payload_hex": "00000000280000F0"
+    },
+    {
+      "number": 16,
+      "name": "BM_Taxi_Notalarm_RAW_1",
+      "payload_hex": "00002000200000F0"
+    },
+    {
+      "number": 17,
+      "name": "BM_Telematik_Abbruchgrund_RAW_1",
+      "payload_hex": "00000000600000F0"
+    },
+    {
+      "number": 18,
+      "name": "BM_Telematik_Abbruchgrund_RAW_10",
+      "payload_hex": "00000000A00200F0"
+    },
+    {
+      "number": 19,
+      "name": "BM_Telematik_Abbruchgrund_RAW_11",
+      "payload_hex": "00000000E00200F0"
+    },
+    {
+      "number": 20,
+      "name": "BM_Telematik_Abbruchgrund_RAW_12",
+      "payload_hex": "00000000200300F0"
+    },
+    {
+      "number": 21,
+      "name": "BM_Telematik_Abbruchgrund_RAW_13",
+      "payload_hex": "00000000600300F0"
+    },
+    {
+      "number": 22,
+      "name": "BM_Telematik_Abbruchgrund_RAW_14",
+      "payload_hex": "00000000A00300F0"
+    },
+    {
+      "number": 23,
+      "name": "BM_Telematik_Abbruchgrund_RAW_15",
+      "payload_hex": "00000000E00300F0"
+    },
+    {
+      "number": 24,
+      "name": "BM_Telematik_Abbruchgrund_RAW_16",
+      "payload_hex": "00000000200400F0"
+    },
+    {
+      "number": 25,
+      "name": "BM_Telematik_Abbruchgrund_RAW_17",
+      "payload_hex": "00000000600400F0"
+    },
+    {
+      "number": 26,
+      "name": "BM_Telematik_Abbruchgrund_RAW_18",
+      "payload_hex": "00000000A00400F0"
+    },
+    {
+      "number": 27,
+      "name": "BM_Telematik_Abbruchgrund_RAW_19",
+      "payload_hex": "00000000E00400F0"
+    },
+    {
+      "number": 28,
+      "name": "BM_Telematik_Abbruchgrund_RAW_2",
+      "payload_hex": "00000000A00000F0"
+    },
+    {
+      "number": 29,
+      "name": "BM_Telematik_Abbruchgrund_RAW_20",
+      "payload_hex": "00000000200500F0"
+    },
+    {
+      "number": 30,
+      "name": "BM_Telematik_Abbruchgrund_RAW_21",
+      "payload_hex": "00000000600500F0"
+    },
+    {
+      "number": 31,
+      "name": "BM_Telematik_Abbruchgrund_RAW_22",
+      "payload_hex": "00000000A00500F0"
+    },
+    {
+      "number": 32,
+      "name": "BM_Telematik_Abbruchgrund_RAW_23",
+      "payload_hex": "00000000E00500F0"
+    },
+    {
+      "number": 33,
+      "name": "BM_Telematik_Abbruchgrund_RAW_24",
+      "payload_hex": "00000000200600F0"
+    },
+    {
+      "number": 34,
+      "name": "BM_Telematik_Abbruchgrund_RAW_25",
+      "payload_hex": "00000000600600F0"
+    },
+    {
+      "number": 35,
+      "name": "BM_Telematik_Abbruchgrund_RAW_26",
+      "payload_hex": "00000000A00600F0"
+    },
+    {
+      "number": 36,
+      "name": "BM_Telematik_Abbruchgrund_RAW_27",
+      "payload_hex": "00000000E00600F0"
+    },
+    {
+      "number": 37,
+      "name": "BM_Telematik_Abbruchgrund_RAW_28",
+      "payload_hex": "00000000200700F0"
+    },
+    {
+      "number": 38,
+      "name": "BM_Telematik_Abbruchgrund_RAW_29",
+      "payload_hex": "00000000600700F0"
+    },
+    {
+      "number": 39,
+      "name": "BM_Telematik_Abbruchgrund_RAW_3",
+      "payload_hex": "00000000E00000F0"
+    },
+    {
+      "number": 40,
+      "name": "BM_Telematik_Abbruchgrund_RAW_30",
+      "payload_hex": "00000000A00700F0"
+    },
+    {
+      "number": 41,
+      "name": "BM_Telematik_Abbruchgrund_RAW_31",
+      "payload_hex": "00000000E00700F0"
+    },
+    {
+      "number": 42,
+      "name": "BM_Telematik_Abbruchgrund_RAW_32",
+      "payload_hex": "00000000200800F0"
+    },
+    {
+      "number": 43,
+      "name": "BM_Telematik_Abbruchgrund_RAW_33",
+      "payload_hex": "00000000600800F0"
+    },
+    {
+      "number": 44,
+      "name": "BM_Telematik_Abbruchgrund_RAW_34",
+      "payload_hex": "00000000A00800F0"
+    },
+    {
+      "number": 45,
+      "name": "BM_Telematik_Abbruchgrund_RAW_35",
+      "payload_hex": "00000000E00800F0"
+    },
+    {
+      "number": 46,
+      "name": "BM_Telematik_Abbruchgrund_RAW_36",
+      "payload_hex": "00000000200900F0"
+    },
+    {
+      "number": 47,
+      "name": "BM_Telematik_Abbruchgrund_RAW_37",
+      "payload_hex": "00000000600900F0"
+    },
+    {
+      "number": 48,
+      "name": "BM_Telematik_Abbruchgrund_RAW_38",
+      "payload_hex": "00000000A00900F0"
+    },
+    {
+      "number": 49,
+      "name": "BM_Telematik_Abbruchgrund_RAW_39",
+      "payload_hex": "00000000E00900F0"
+    },
+    {
+      "number": 50,
+      "name": "BM_Telematik_Abbruchgrund_RAW_4",
+      "payload_hex": "00000000200100F0"
+    },
+    {
+      "number": 51,
+      "name": "BM_Telematik_Abbruchgrund_RAW_40",
+      "payload_hex": "00000000200A00F0"
+    },
+    {
+      "number": 52,
+      "name": "BM_Telematik_Abbruchgrund_RAW_41",
+      "payload_hex": "00000000600A00F0"
+    },
+    {
+      "number": 53,
+      "name": "BM_Telematik_Abbruchgrund_RAW_42",
+      "payload_hex": "00000000A00A00F0"
+    },
+    {
+      "number": 54,
+      "name": "BM_Telematik_Abbruchgrund_RAW_43",
+      "payload_hex": "00000000E00A00F0"
+    },
+    {
+      "number": 55,
+      "name": "BM_Telematik_Abbruchgrund_RAW_44",
+      "payload_hex": "00000000200B00F0"
+    },
+    {
+      "number": 56,
+      "name": "BM_Telematik_Abbruchgrund_RAW_45",
+      "payload_hex": "00000000600B00F0"
+    },
+    {
+      "number": 57,
+      "name": "BM_Telematik_Abbruchgrund_RAW_46",
+      "payload_hex": "00000000A00B00F0"
+    },
+    {
+      "number": 58,
+      "name": "BM_Telematik_Abbruchgrund_RAW_47",
+      "payload_hex": "00000000E00B00F0"
+    },
+    {
+      "number": 59,
+      "name": "BM_Telematik_Abbruchgrund_RAW_48",
+      "payload_hex": "00000000200C00F0"
+    },
+    {
+      "number": 60,
+      "name": "BM_Telematik_Abbruchgrund_RAW_49",
+      "payload_hex": "00000000600C00F0"
+    },
+    {
+      "number": 61,
+      "name": "BM_Telematik_Abbruchgrund_RAW_5",
+      "payload_hex": "00000000600100F0"
+    },
+    {
+      "number": 62,
+      "name": "BM_Telematik_Abbruchgrund_RAW_50",
+      "payload_hex": "00000000A00C00F0"
+    },
+    {
+      "number": 63,
+      "name": "BM_Telematik_Abbruchgrund_RAW_51",
+      "payload_hex": "00000000E00C00F0"
+    },
+    {
+      "number": 64,
+      "name": "BM_Telematik_Abbruchgrund_RAW_52",
+      "payload_hex": "00000000200D00F0"
+    },
+    {
+      "number": 65,
+      "name": "BM_Telematik_Abbruchgrund_RAW_53",
+      "payload_hex": "00000000600D00F0"
+    },
+    {
+      "number": 66,
+      "name": "BM_Telematik_Abbruchgrund_RAW_54",
+      "payload_hex": "00000000A00D00F0"
+    },
+    {
+      "number": 67,
+      "name": "BM_Telematik_Abbruchgrund_RAW_55",
+      "payload_hex": "00000000E00D00F0"
+    },
+    {
+      "number": 68,
+      "name": "BM_Telematik_Abbruchgrund_RAW_56",
+      "payload_hex": "00000000200E00F0"
+    },
+    {
+      "number": 69,
+      "name": "BM_Telematik_Abbruchgrund_RAW_57",
+      "payload_hex": "00000000600E00F0"
+    },
+    {
+      "number": 70,
+      "name": "BM_Telematik_Abbruchgrund_RAW_58",
+      "payload_hex": "00000000A00E00F0"
+    },
+    {
+      "number": 71,
+      "name": "BM_Telematik_Abbruchgrund_RAW_59",
+      "payload_hex": "00000000E00E00F0"
+    },
+    {
+      "number": 72,
+      "name": "BM_Telematik_Abbruchgrund_RAW_6",
+      "payload_hex": "00000000A00100F0"
+    },
+    {
+      "number": 73,
+      "name": "BM_Telematik_Abbruchgrund_RAW_60",
+      "payload_hex": "00000000200F00F0"
+    },
+    {
+      "number": 74,
+      "name": "BM_Telematik_Abbruchgrund_RAW_61",
+      "payload_hex": "00000000600F00F0"
+    },
+    {
+      "number": 75,
+      "name": "BM_Telematik_Abbruchgrund_RAW_62",
+      "payload_hex": "00000000A00F00F0"
+    },
+    {
+      "number": 76,
+      "name": "BM_Telematik_Abbruchgrund_RAW_63",
+      "payload_hex": "00000000E00F00F0"
+    },
+    {
+      "number": 77,
+      "name": "BM_Telematik_Abbruchgrund_RAW_7",
+      "payload_hex": "00000000E00100F0"
+    },
+    {
+      "number": 78,
+      "name": "BM_Telematik_Abbruchgrund_RAW_8",
+      "payload_hex": "00000000200200F0"
+    },
+    {
+      "number": 79,
+      "name": "BM_Telematik_Abbruchgrund_RAW_9",
+      "payload_hex": "00000000600200F0"
+    },
+    {
+      "number": 80,
+      "name": "BM_Telematik_RAW_1",
+      "payload_hex": "00004000200000F0"
+    },
+    {
+      "number": 81,
+      "name": "BM_WBT_Beleuchtung_RAW_1",
+      "payload_hex": "00000000210000F0"
+    },
+    {
+      "number": 82,
+      "name": "BM_Warnblinken_RAW_1",
+      "payload_hex": "00001000200000F0"
+    },
+    {
+      "number": 83,
+      "name": "BM_Wischblinken_RAW_0",
+      "payload_hex": "00000000000000F0"
+    },
+    {
+      "number": 84,
+      "name": "BM_ZV_auf_RAW_1",
+      "payload_hex": "00100000200000F0"
+    },
+    {
+      "number": 85,
+      "name": "BM_ZV_zu_RAW_1",
+      "payload_hex": "00200000200000F0"
+    },
+    {
+      "number": 86,
+      "name": "BM_links_RAW_1",
+      "payload_hex": "00008000200000F0"
+    },
+    {
+      "number": 87,
+      "name": "BM_rechts_RAW_1",
+      "payload_hex": "00000001200000F0"
+    },
+    {
+      "number": 88,
+      "name": "Blinken_li_Fzg_Takt_RAW_1",
+      "payload_hex": "00000002200000F0"
+    },
+    {
+      "number": 89,
+      "name": "Blinken_li_Kombi_Takt_RAW_1",
+      "payload_hex": "00000008200000F0"
+    },
+    {
+      "number": 90,
+      "name": "Blinken_re_Fzg_Takt_RAW_1",
+      "payload_hex": "00000004200000F0"
+    },
+    {
+      "number": 91,
+      "name": "Blinken_re_Kombi_Takt_RAW_1",
+      "payload_hex": "00000010200000F0"
+    },
+    {
+      "number": 92,
+      "name": "DWA_Alarmquelle_RAW_0",
+      "payload_hex": "0000000020000000"
+    },
+    {
+      "number": 93,
+      "name": "DWA_Alarmquelle_RAW_1",
+      "payload_hex": "0000000020000008"
+    },
+    {
+      "number": 94,
+      "name": "DWA_Alarmquelle_RAW_10",
+      "payload_hex": "0000000020000050"
+    },
+    {
+      "number": 95,
+      "name": "DWA_Alarmquelle_RAW_11",
+      "payload_hex": "0000000020000058"
+    },
+    {
+      "number": 96,
+      "name": "DWA_Alarmquelle_RAW_12",
+      "payload_hex": "0000000020000060"
+    },
+    {
+      "number": 97,
+      "name": "DWA_Alarmquelle_RAW_13",
+      "payload_hex": "0000000020000068"
+    },
+    {
+      "number": 98,
+      "name": "DWA_Alarmquelle_RAW_14",
+      "payload_hex": "0000000020000070"
+    },
+    {
+      "number": 99,
+      "name": "DWA_Alarmquelle_RAW_15",
+      "payload_hex": "0000000020000078"
+    },
+    {
+      "number": 100,
+      "name": "DWA_Alarmquelle_RAW_16",
+      "payload_hex": "0000000020000080"
+    },
+    {
+      "number": 101,
+      "name": "DWA_Alarmquelle_RAW_17",
+      "payload_hex": "0000000020000088"
+    },
+    {
+      "number": 102,
+      "name": "DWA_Alarmquelle_RAW_18",
+      "payload_hex": "0000000020000090"
+    },
+    {
+      "number": 103,
+      "name": "DWA_Alarmquelle_RAW_19",
+      "payload_hex": "0000000020000098"
+    },
+    {
+      "number": 104,
+      "name": "DWA_Alarmquelle_RAW_2",
+      "payload_hex": "0000000020000010"
+    },
+    {
+      "number": 105,
+      "name": "DWA_Alarmquelle_RAW_20",
+      "payload_hex": "00000000200000A0"
+    },
+    {
+      "number": 106,
+      "name": "DWA_Alarmquelle_RAW_21",
+      "payload_hex": "00000000200000A8"
+    },
+    {
+      "number": 107,
+      "name": "DWA_Alarmquelle_RAW_22",
+      "payload_hex": "00000000200000B0"
+    },
+    {
+      "number": 108,
+      "name": "DWA_Alarmquelle_RAW_23",
+      "payload_hex": "00000000200000B8"
+    },
+    {
+      "number": 109,
+      "name": "DWA_Alarmquelle_RAW_24",
+      "payload_hex": "00000000200000C0"
+    },
+    {
+      "number": 110,
+      "name": "DWA_Alarmquelle_RAW_25",
+      "payload_hex": "00000000200000C8"
+    },
+    {
+      "number": 111,
+      "name": "DWA_Alarmquelle_RAW_26",
+      "payload_hex": "00000000200000D0"
+    },
+    {
+      "number": 112,
+      "name": "DWA_Alarmquelle_RAW_27",
+      "payload_hex": "00000000200000D8"
+    },
+    {
+      "number": 113,
+      "name": "DWA_Alarmquelle_RAW_28",
+      "payload_hex": "00000000200000E0"
+    },
+    {
+      "number": 114,
+      "name": "DWA_Alarmquelle_RAW_29",
+      "payload_hex": "00000000200000E8"
+    },
+    {
+      "number": 115,
+      "name": "DWA_Alarmquelle_RAW_3",
+      "payload_hex": "0000000020000018"
+    },
+    {
+      "number": 116,
+      "name": "DWA_Alarmquelle_RAW_31",
+      "payload_hex": "00000000200000F8"
+    },
+    {
+      "number": 117,
+      "name": "DWA_Alarmquelle_RAW_4",
+      "payload_hex": "0000000020000020"
+    },
+    {
+      "number": 118,
+      "name": "DWA_Alarmquelle_RAW_5",
+      "payload_hex": "0000000020000028"
+    },
+    {
+      "number": 119,
+      "name": "DWA_Alarmquelle_RAW_6",
+      "payload_hex": "0000000020000030"
+    },
+    {
+      "number": 120,
+      "name": "DWA_Alarmquelle_RAW_7",
+      "payload_hex": "0000000020000038"
+    },
+    {
+      "number": 121,
+      "name": "DWA_Alarmquelle_RAW_8",
+      "payload_hex": "0000000020000040"
+    },
+    {
+      "number": 122,
+      "name": "DWA_Alarmquelle_RAW_9",
+      "payload_hex": "0000000020000048"
+    }
+  ]
+}
