@@ -1,0 +1,47 @@
+# Common values live here so the normal command stays short:
+#   python canoe_fuzzer.py -m signal_single -x
+dbc: ../A5.dbc
+
+target:
+  id: 0x366
+  source_bus: B_CAN
+  baseline_payload: "00 00 00 00 20 00 00 F0"
+
+mutation:
+  # CLI -m/--method overrides this value.
+  method: signal_single
+  max_cases: 10
+  random_seed: 366
+  undefined_max_bits: 2
+  duration_seconds: 1.0
+  interval_ms: 50.0
+
+transmit:
+  restore_original: true
+  restore_count: 1
+  case_gap_ms: 100.0
+
+canoe:
+  prog_id: CANoe.Application
+  channel: 1
+  # true: attach to an already-open CANoe application.
+  attach_existing: true
+  visible: true
+
+  # Set both fields when Python should load a specific CANoe configuration.
+  configuration_path: null
+  open_configuration: false
+
+  # Leave Measurement stopped before launch. GetFunction must be captured from
+  # Measurement.OnInit, so the tool starts it after registering the event.
+  start_measurement: true
+  # false (safe default): fail if Measurement was already running.
+  # Set true only when this tool may stop and restart that measurement.
+  restart_running_measurement: false
+  # Stop a measurement started by this tool so repeated runs stay deterministic.
+  stop_measurement_on_close: true
+  compile_capl: true
+  measurement_timeout_seconds: 10.0
+
+  # Implemented by canoe/AutoFuzzTx.can in the active configuration.
+  capl_function: AutoFuzzSend

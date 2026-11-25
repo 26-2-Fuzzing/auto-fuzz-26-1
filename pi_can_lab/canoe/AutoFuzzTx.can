@@ -1,0 +1,45 @@
+/*@!Encoding:65001*/
+
+/*
+ * Classic CAN bridge for canoe_fuzzer.py.
+ *
+ * Add this program as a CAPL program block (P block) in CANoe's Measurement
+ * Setup on the transmit/real-time path.  The Python adapter invokes
+ * AutoFuzzSend through the CANoe COM CAPL interface.  Each word contains two
+ * little-endian payload bytes, which keeps the COM call compact and avoids
+ * array-marshalling differences between CANoe versions.
+ */
+
+variables
+{
+  message 0x0 AutoFuzzTxMessage;
+}
+
+void AutoFuzzSend(
+  long channel,
+  long canId,
+  long dlc,
+  long word0,
+  long word1,
+  long word2,
+  long word3)
+{
+  if (channel < 1 || canId < 0 || canId > 0x7FF || dlc < 0 || dlc > 8)
+  {
+    return;
+  }
+
+  AutoFuzzTxMessage.CAN = channel;
+  AutoFuzzTxMessage.ID = canId;
+  AutoFuzzTxMessage.DLC = dlc;
+  AutoFuzzTxMessage.byte(0) = word0 & 0xFF;
+  AutoFuzzTxMessage.byte(1) = (word0 >> 8) & 0xFF;
+  AutoFuzzTxMessage.byte(2) = word1 & 0xFF;
+  AutoFuzzTxMessage.byte(3) = (word1 >> 8) & 0xFF;
+  AutoFuzzTxMessage.byte(4) = word2 & 0xFF;
+  AutoFuzzTxMessage.byte(5) = (word2 >> 8) & 0xFF;
+  AutoFuzzTxMessage.byte(6) = word3 & 0xFF;
+  AutoFuzzTxMessage.byte(7) = (word3 >> 8) & 0xFF;
+
+  output(AutoFuzzTxMessage);
+}

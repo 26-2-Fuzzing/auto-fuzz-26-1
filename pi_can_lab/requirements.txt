@@ -2,3 +2,4 @@ python-can>=4.3,<5
 cantools>=39,<41
 PyYAML>=6,<7
 paramiko>=3.4,<5
+pywin32>=306; sys_platform == "win32"
