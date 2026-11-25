@@ -145,6 +145,19 @@ bash "$repo/pi_can_lab/canoe-paired-wsl.sh" \
   --case-start 21 -n 20 -m "$method" -x
 ```
 
+중간 번호부터 재개할 때는 시작 번호와 이번 묶음의 개수를 바꾼다. 예를 들어
+3~20번을 실행하려면 **같은 방식의 같은 campaign에서 1·2번이 완료됐는지**
+먼저 확인하고 다음 명령을 쓴다.
+
+```bash
+start=3
+count=18
+bash "$repo/pi_can_lab/canoe-paired-wsl.sh" \
+  --channel "$channel" --canoe-config "$cfg" \
+  --reference-baseline-log "$baseline" --campaign-dir "$campaign" \
+  --case-start "$start" -n "$count" -m "$method" -x
+```
+
 완료된 case를 다시 선택하면 저장된 결과를 검증한 뒤 송신 없이 건너뛴다.
 중간에 실패한 case는 `error.json`과 원본 BLF·ASC를 보존하며 자동으로
 재송신하지 않는다. 실패가 나면 원인을 확인하기 전 다음 case 번호로
