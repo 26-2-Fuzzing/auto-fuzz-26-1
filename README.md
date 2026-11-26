@@ -10,6 +10,8 @@ Windows CANoe와 WSL에서 mutation 방식을 선택해 CAN2로 송신하고 CAN
 실행하면 30초 참조 baseline 수집부터 paired 송신과 로그 저장까지 진행합니다.
 저장소 위치는 스크립트가 자동으로 찾으며, CANoe에는 이 브랜치의
 `pi_can_lab/canoe/config/ThreeChannelCAN.cfg`를 열어 둡니다.
+campaign은 mutation 방식별 고정 폴더를 사용하므로 다음 묶음은
+`--case-start`만 바꿔 실행합니다.
 
 ## 🚀 개발 환경 세팅
 ### 1. 요구사항

@@ -16,13 +16,15 @@ captures a 30-second receive-only reference baseline for a new campaign.
   -x, --execute                   Probe first, then transmit paired cases
   --probe-only                    Capture baseline and validate passive Rx only
   --canoe-config PATH             CFG actually open in CANoe (WSL path)
-  --campaign-dir PATH             Existing campaign when resuming (WSL path)
+  --campaign-dir PATH             Override the fixed method campaign (WSL path)
   --reference-baseline-log PATH   Use an existing BLF/ASC pair instead of capture
 
+Each method uses the fixed campaign path pi_can_lab/logs/canoe_paired/METHOD.
+To resume, use the same method with --case-start; no campaign path is needed.
+Use --campaign-dir only to start a separate campaign for that method.
 Without -x, a fresh campaign captures the passive reference baseline and
 previews the plan but does not transmit. Every -x call additionally runs a
-6-second passive probe before paired transmission. Save the printed campaign
-path and pass it with --campaign-dir to resume later.
+6-second passive probe before paired transmission.
 EOF
 }
 
@@ -156,6 +158,15 @@ if "$execute" && "$probe_only"; then
     fail "Choose either -x or --probe-only."
 fi
 [[ -f "$cfg" ]] || fail "CANoe configuration not found: $cfg"
+if [[ -z "$campaign" ]]; then
+    campaign="$repo_dir/pi_can_lab/logs/canoe_paired/$method"
+fi
+[[ "$case_start" =~ ^[0-9]+$ ]] || fail "Case start must be a positive number."
+case_start_number=$((10#$case_start))
+((case_start_number >= 1)) || fail "Case start must be a positive number."
+if ((case_start_number > 1)) && [[ ! -f "$campaign/campaign.json" ]]; then
+    fail "No existing campaign for case $case_start_number: $campaign. Start at case 1."
+fi
 
 python_exe="$repo_dir/.venv-win/Scripts/python.exe"
 if [[ ! -f "$python_exe" ]]; then
@@ -166,12 +177,6 @@ if [[ ! -f "$python_exe" ]]; then
 fi
 
 mkdir -p "$repo_dir/pi_can_lab/canoe/logs/capture"
-if [[ -z "$campaign" ]]; then
-    [[ "$case_start" == 1 ]] || fail "Pass --campaign-dir to resume from case $case_start."
-    root="$repo_dir/pi_can_lab/logs/canoe_paired"
-    mkdir -p "$root"
-    campaign="$(mktemp -d "$root/${method}_$(date -u +%Y%m%dT%H%M%SZ)_XXXXXX")"
-fi
 
 arguments=(--channel 2 --canoe-config "$cfg" --campaign-dir "$campaign" -m "$method")
 arguments+=(-n "$count_number")

@@ -59,7 +59,8 @@ bash pi_can_lab/canoe-run-wsl.sh -m signal_single -n 1 -x
 
 `-m`에 아래 표의 mutation 방식을, `-n`에 이번 묶음의 case 수(1~20)를
 넣는다. 예를 들어 `-m undefined_enum -n 10 -x`도 같은 방식으로 실행된다.
-새 campaign에서는 스크립트가 30초 동안 **송신 없이** CANoe 참조 baseline을
+방식별 고정 경로 `pi_can_lab/logs/canoe_paired/<method>`에 첫 campaign이
+만들어진다. 첫 실행에서는 스크립트가 30초 동안 **송신 없이** CANoe 참조 baseline을
 기록하고 BLF·ASC를 저장한다. Python은 그중 CAN2에서 수신된 표준 CAN ID
 `0x366`의 8바이트 payload 중 과반 값을 원본으로 고른다. 전체 BLF를 변이
 입력으로 쓰는 것은 아니다. 이어서 6초 무송신 probe로 CAPL 동작과 CAN1·2·3
@@ -67,15 +68,19 @@ bash pi_can_lab/canoe-run-wsl.sh -m signal_single -n 1 -x
 CANoe는 각 측정의 BLF·ASC를 기록하며 실행기는 완결된 로그를 campaign에
 복사한다. 처음 수집한 참조 baseline은 같은 campaign에서 재사용한다.
 
-실행 초기에 출력되는 `[CAMPAIGN]` 경로를 보관한다. 다음 묶음은 그 경로를
-`--campaign-dir`에 넣고 시작 번호만 바꾼다. 아래는 1~20번을 완료한 뒤의
-예시다.
+같은 방식의 다음 묶음은 campaign 경로를 다시 지정할 필요가 없다. 아래는
+`signal_single` 1~20번을 완료한 뒤 21~40번을 실행하는 예시다.
 
 ```bash
-campaign="/mnt/c/path/printed/by/CAMPAIGN"
 bash pi_can_lab/canoe-run-wsl.sh -m signal_single -n 20 \
-  --campaign-dir "$campaign" --case-start 21 -x
+  --case-start 21 -x
 ```
+
+같은 방식으로 다시 실행하면 저장된 참조 baseline을 검증해 재사용한다.
+완료된 case는 송신 없이 건너뛰고, 중단된 case는 자동 재송신하지 않는다.
+새 차량 상태나 다른 참조 baseline으로 별도 실험을 시작하려면
+`--campaign-dir "$repo/pi_can_lab/logs/canoe_paired/새_실험_이름"`을
+명시해 기존 campaign을 보존한다. mutation 방식마다 기본 고정 폴더가 다르다.
 
 기본값은 저장소에 포함된 CFG다. CANoe에서 다른 위치의 동명 CFG를 열었다면
 `--canoe-config "/mnt/c/path/to/that/ThreeChannelCAN.cfg"`를 명령에 추가한다.
