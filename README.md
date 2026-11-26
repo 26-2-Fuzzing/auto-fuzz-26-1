@@ -6,6 +6,10 @@
 Windows CANoe와 WSL에서 mutation 방식을 선택해 CAN2로 송신하고 CAN1/2/3을 수집하는 절차는
 [CANoe paired 실행 가이드](pi_can_lab/CANOE_PAIRED.md)를 참고하세요.
 설치 의존성은 `pi_can_lab/requirements-canoe.txt`에 있습니다.
+처음 준비한 뒤 저장소 루트에서 `bash pi_can_lab/canoe-run-wsl.sh -m signal_single -n 1 -x`를
+실행하면 30초 참조 baseline 수집부터 paired 송신과 로그 저장까지 진행합니다.
+저장소 위치는 스크립트가 자동으로 찾으며, CANoe에는 이 브랜치의
+`pi_can_lab/canoe/config/ThreeChannelCAN.cfg`를 열어 둡니다.
 
 ## 🚀 개발 환경 세팅
 ### 1. 요구사항

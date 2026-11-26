@@ -56,7 +56,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-m", "--method", choices=CYCLE_FAMILIES, default="signal_single")
     parser.add_argument("--channel", type=int, choices=(2,), required=True)
     parser.add_argument("--canoe-config", type=Path, required=True)
-    parser.add_argument("--reference-baseline-log", type=Path, required=True)
+    parser.add_argument("--reference-baseline-log", type=Path,
+                        help="use an existing completed reference BLF/ASC pair")
+    parser.add_argument("--capture-reference-baseline", action="store_true",
+                        help="capture one passive 30-second reference pair in a new campaign, or reuse it")
     parser.add_argument("--campaign-dir", type=Path, required=True)
     parser.add_argument("--case-start", type=int, default=1)
     parser.add_argument("-n", "--cases", type=int, default=1)
@@ -530,6 +533,85 @@ def _planned_slot_frames(
     )
 
 
+def _read_reference_baseline(reference: Path, channel: int) -> Any:
+    reference = reference.resolve(strict=True)
+    asc = reference.with_suffix(".asc")
+    if reference.suffix.lower() != ".blf" or not asc.is_file():
+        raise ConfigurationError("paired campaign needs a completed BLF/ASC baseline pair")
+    with asc.open("rb") as source:
+        source.seek(max(0, asc.stat().st_size - 256))
+        if not source.read().rstrip().endswith(b"End TriggerBlock"):
+            raise ConfigurationError("reference baseline ASC has no final End TriggerBlock")
+    return select_baseline(reference, channel, 0x366)
+
+
+def _capture_or_reuse_reference(
+    campaign_dir: Path, config: Path, channel: int,
+) -> tuple[Path, Any]:
+    """Freeze one passive reference pair; never recapture an incomplete one."""
+    campaign_dir.mkdir(parents=True, exist_ok=True)
+    root = campaign_dir / "reference_baseline"
+    marker_path = root / "reference.json"
+    raw_dir = root / "raw"
+    if root.exists():
+        if not marker_path.is_file() or not raw_dir.is_dir():
+            raise ConfigurationError(
+                "Reference baseline capture is incomplete; keep its logs and use a new campaign"
+            )
+        marker = _read_json(marker_path)
+        if not isinstance(marker, dict) or marker.get("schema_version") != 1 or marker.get("status") != "captured":
+            raise ConfigurationError("Saved reference baseline marker is invalid")
+        names = (marker.get("blf_name"), marker.get("asc_name"))
+        if not all(isinstance(name, str) and Path(name).name == name for name in names):
+            raise ConfigurationError("Saved reference baseline filenames are invalid")
+        blf = raw_dir / names[0]
+        asc = raw_dir / names[1]
+        if (blf.suffix.lower(), asc.suffix.lower()) != (".blf", ".asc") or blf.stem != asc.stem:
+            raise ConfigurationError("Saved reference baseline pair differs")
+        if not blf.is_file() or not asc.is_file() or set(raw_dir.iterdir()) != {blf, asc}:
+            raise ConfigurationError("Saved reference baseline logs are missing or changed")
+        if (_hash_file(blf) != marker.get("blf_sha256")
+                or _hash_file(asc) != marker.get("asc_sha256")):
+            raise ConfigurationError("Saved reference baseline log changed")
+        if (marker.get("configuration") != str(config)
+                or marker.get("channel") != channel
+                or marker.get("frame_id") != "0x366"
+                or marker.get("duration_seconds") != BASELINE_SECONDS):
+            raise ConfigurationError("Saved reference baseline configuration differs")
+        baseline = _read_reference_baseline(blf, channel)
+        if (baseline.payload_hex != marker.get("baseline_payload_hex")
+                or baseline.matching_frames != marker.get("matching_rx_frames")):
+            raise ConfigurationError("Saved reference baseline payload changed")
+        print(f"[REFERENCE BASELINE] reused CAN{channel} 0x366 {baseline.payload_hex}; BLF={blf}")
+        return blf, baseline
+
+    if any(campaign_dir.iterdir()):
+        raise ConfigurationError("Automatic reference baseline requires an empty new campaign")
+    _disk_preflight(campaign_dir, 1, config)
+    root.mkdir()
+    blf, asc = capture_measurement(raw_dir, BASELINE_SECONDS, expected_config=config)
+    if blf.with_suffix(".asc") != asc:
+        raise ConfigurationError("Captured reference baseline BLF/ASC pair differs")
+    baseline = _read_reference_baseline(blf, channel)
+    _write_json(marker_path, {
+        "schema_version": 1,
+        "status": "captured",
+        "configuration": str(config),
+        "channel": channel,
+        "frame_id": "0x366",
+        "duration_seconds": BASELINE_SECONDS,
+        "blf_name": blf.name,
+        "asc_name": asc.name,
+        "blf_sha256": _hash_file(blf),
+        "asc_sha256": _hash_file(asc),
+        "baseline_payload_hex": baseline.payload_hex,
+        "matching_rx_frames": baseline.matching_frames,
+    })
+    print(f"[REFERENCE BASELINE] captured 30s CAN{channel} 0x366 {baseline.payload_hex} "
+          f"from {baseline.matching_frames} Rx frames; BLF={blf}")
+    return blf, baseline
+
+
 def run(args: argparse.Namespace) -> Path:
     if args.case_start < 1 or not 1 <= args.cases <= 20:
         raise ConfigurationError("paired case start must be >= 1 and batch size must be 1..20")
@@ -540,15 +622,11 @@ def run(args: argparse.Namespace) -> Path:
         raise ConfigurationError("Only the observed interrupted case 2 can be excluded")
     if args.accept_operator_door_open and args.exclude_interrupted_case != 2:
         raise ConfigurationError("--accept-operator-door-open requires --exclude-interrupted-case 2")
+    if bool(args.reference_baseline_log) == bool(args.capture_reference_baseline):
+        raise ConfigurationError(
+            "Choose exactly one of --reference-baseline-log or --capture-reference-baseline"
+        )
     config = args.canoe_config.resolve(strict=True)
-    reference = args.reference_baseline_log.resolve(strict=True)
-    if reference.suffix.lower() != ".blf" or not reference.with_suffix(".asc").is_file():
-        raise ConfigurationError("paired campaign needs a completed BLF/ASC baseline pair")
-    with reference.with_suffix(".asc").open("rb") as source:
-        source.seek(max(0, reference.with_suffix(".asc").stat().st_size - 256))
-        if not source.read().rstrip().endswith(b"End TriggerBlock"):
-            raise ConfigurationError("reference baseline ASC has no final End TriggerBlock")
-    baseline = select_baseline(reference, args.channel, 0x366)
     settings = load_settings(args)
     if (
         settings.frame_id != 0x366
@@ -561,11 +639,20 @@ def run(args: argparse.Namespace) -> Path:
         raise ConfigurationError("paired CANoe mode requires the 0x366/50ms/1s stage-1 contract")
     if args.exclude_interrupted_case is not None and settings.method != "signal_single":
         raise ConfigurationError("the archived case-2 exclusion applies only to signal_single")
-    settings = replace(settings, baseline_payload=baseline.payload)
-    selection = select_mutation_cases(settings, first_case=args.case_start)
     campaign_dir = args.campaign_dir.resolve()
     if campaign_dir.exists() and not campaign_dir.is_dir():
         raise ConfigurationError("campaign path is not a directory")
+    if args.capture_reference_baseline:
+        if args.case_start != 1 and not (campaign_dir / "reference_baseline").exists():
+            raise ConfigurationError("new automatic baseline campaign must start at case 1")
+        reference, baseline = _capture_or_reuse_reference(
+            campaign_dir, config, args.channel
+        )
+    else:
+        reference = args.reference_baseline_log.resolve(strict=True)
+        baseline = _read_reference_baseline(reference, args.channel)
+    settings = replace(settings, baseline_payload=baseline.payload)
+    selection = select_mutation_cases(settings, first_case=args.case_start)
     campaign_dir.mkdir(parents=True, exist_ok=True)
     manifest = {
         "schema_version": 2,

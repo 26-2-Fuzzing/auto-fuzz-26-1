@@ -46,6 +46,45 @@ py.exe -3 -m venv "$(wslpath -w "$repo/.venv-win")"
   "$(wslpath -w "$repo/pi_can_lab/requirements-canoe.txt")"
 ```
 
+## 팀원용 자동 실행
+
+위 준비를 마치고 CANoe에서 CFG를 열어 세 채널을 매핑한 뒤, **측정을 정지한
+상태**에서 WSL의 저장소 루트에서 아래 명령을 실행한다. `repo`의 실제 경로는
+사람마다 달라도 된다. 실행 스크립트가 자신의 위치에서 저장소와 기본 CFG를
+찾는다.
+
+```bash
+bash pi_can_lab/canoe-run-wsl.sh -m signal_single -n 1 -x
+```
+
+`-m`에 아래 표의 mutation 방식을, `-n`에 이번 묶음의 case 수(1~20)를
+넣는다. 예를 들어 `-m undefined_enum -n 10 -x`도 같은 방식으로 실행된다.
+새 campaign에서는 스크립트가 30초 동안 **송신 없이** CANoe 참조 baseline을
+기록하고 BLF·ASC를 저장한다. Python은 그중 CAN2에서 수신된 표준 CAN ID
+`0x366`의 8바이트 payload 중 과반 값을 원본으로 고른다. 전체 BLF를 변이
+입력으로 쓰는 것은 아니다. 이어서 6초 무송신 probe로 CAPL 동작과 CAN1·2·3
+수신을 확인하고, `-x`가 있을 때만 mutation/no-op paired 송신을 시작한다.
+CANoe는 각 측정의 BLF·ASC를 기록하며 실행기는 완결된 로그를 campaign에
+복사한다. 처음 수집한 참조 baseline은 같은 campaign에서 재사용한다.
+
+실행 초기에 출력되는 `[CAMPAIGN]` 경로를 보관한다. 다음 묶음은 그 경로를
+`--campaign-dir`에 넣고 시작 번호만 바꾼다. 아래는 1~20번을 완료한 뒤의
+예시다.
+
+```bash
+campaign="/mnt/c/path/printed/by/CAMPAIGN"
+bash pi_can_lab/canoe-run-wsl.sh -m signal_single -n 20 \
+  --campaign-dir "$campaign" --case-start 21 -x
+```
+
+기본값은 저장소에 포함된 CFG다. CANoe에서 다른 위치의 동명 CFG를 열었다면
+`--canoe-config "/mnt/c/path/to/that/ThreeChannelCAN.cfg"`를 명령에 추가한다.
+`--canoe-config`는 **CANoe에서 실제 열린 파일**과 같아야 한다. `-x` 없이
+처음 실행하면 참조 baseline을 수집하고 계획만 보여 주며 송신하지 않는다.
+`--probe-only`는 수신 확인까지만 한다. 어떤 모드도 Python 코드를 CAPL로
+변환하지 않는다. WSL은 Windows Python을 실행하고, Python은 CANoe COM으로
+측정과 시스템 변수를 제어하며, CAPL이 CAN2 프레임을 송신한다.
+
 ## mutation 방식 선택
 
 `method`에 `signal_single`, `signal_combination`, `state_contradiction`,
@@ -73,10 +112,12 @@ py.exe -3 -m venv "$(wslpath -w "$repo/.venv-win")"
 예를 들어 이전에 `signal_single`과 겹쳐 실행 목록에서 빠졌던
 `undefined_enum` 53개가 이제 해당 방식의 case로 선택된다.
 
-## 기준 baseline 준비
+## 기존 BLF를 직접 지정하는 방법
 
-첫 실행에는 완료된 **BLF와 ASC 한 쌍**이 필요하다. CANoe에서 대상 차량 상태를
-유지한 채 측정을 시작해 약 30초 동안 수신만 기록하고 측정을 중지한다.
+위 팀원용 명령은 참조 baseline을 자동 수집한다. 이미 보유한 참조 로그를
+사용하려면 아래의 직접 실행 방식을 쓴다. 완료된 **BLF와 ASC 한 쌍**이
+필요하다. CANoe에서 대상 차량 상태를 유지한 채 측정을 시작해 약 30초 동안
+수신만 기록하고 측정을 중지한다.
 자동 증가로 생성된 동일 이름의 `.blf`와 `.asc`가 모두 있고, ASC 끝에
 `End TriggerBlock`이 기록됐는지 확인한다. 그 BLF의 경로를 `baseline`에
 입력한다. 이 파일에서 지정 채널의 `0x366` 수신 payload를 선택하며,

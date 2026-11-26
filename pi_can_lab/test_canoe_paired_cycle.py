@@ -68,15 +68,19 @@ class PairedCycleTests(TestCase):
         FakeSchedule.phases = []
         FakeSchedule.schedules = []
         self.captures = []
+        self.capture_durations = []
 
     def args(self, execute=False, start=1, probe_only=False, exclude=None,
-              door_open=False, method="signal_single"):
+              door_open=False, method="signal_single", auto_reference=False):
         options = [
             "--channel", "2", "--canoe-config", str(self.config),
-            "--reference-baseline-log", str(self.reference),
             "--campaign-dir", str(self.campaign),
             "--case-start", str(start), "-n", "1", "-m", method,
         ]
+        if auto_reference:
+            options.append("--capture-reference-baseline")
+        else:
+            options.extend(("--reference-baseline-log", str(self.reference)))
         if execute:
             options.append("-x")
         if probe_only:
@@ -88,15 +92,18 @@ class PairedCycleTests(TestCase):
         return build_parser().parse_args(options)
 
     def capture(self, output_dir, duration_seconds, expected_config=None, action=None):
-        self.assertEqual(duration_seconds, 0)
         self.assertEqual(expected_config, self.config)
+        self.assertIn(duration_seconds, (0, 30.0))
+        self.assertEqual(action is None, duration_seconds == 30.0)
         output_dir.mkdir(parents=True)
-        action(object())
+        if action is not None:
+            action(object())
         blf = output_dir / "capture.blf"
         asc = output_dir / "capture.asc"
         shutil.copy2(self.reference, blf)
         shutil.copy2(self.reference.with_suffix(".asc"), asc)
         self.captures.append(output_dir)
+        self.capture_durations.append(duration_seconds)
         return blf, asc
 
     def patched_dependencies(self):
@@ -119,6 +126,68 @@ class PairedCycleTests(TestCase):
         self.assertEqual(manifest["workflow"], "canoe_paired_capture")
         self.assertEqual(manifest["total_available_cases"], 122)
         self.assertFalse((self.campaign / "case_0001").exists())
+
+    def test_auto_reference_capture_then_probe_and_pair_reuse_same_logs(self):
+        patches = self.patched_dependencies()
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            run(self.args(probe_only=True, auto_reference=True))
+            self.assertEqual(self.capture_durations, [30.0, 0])
+            reference = self.campaign / "reference_baseline"
+            marker = json.loads((reference / "reference.json").read_text())
+            self.assertEqual(marker["baseline_payload_hex"], BASELINE.hex().upper())
+            self.assertEqual(marker["matching_rx_frames"], 3)
+            self.assertEqual(marker["blf_name"], "capture.blf")
+            self.assertFalse((self.campaign / "case_0001").exists())
+
+            run(self.args(execute=True, auto_reference=True))
+            self.assertEqual(self.capture_durations, [30.0, 0, 0, 0, 0, 0])
+            manifest = json.loads((self.campaign / "campaign.json").read_text())
+            self.assertEqual(
+                Path(manifest["reference_baseline_log"]), reference / "raw" / "capture.blf"
+            )
+            self.assertTrue((self.campaign / "case_0001" / "complete.json").is_file())
+
+    def test_auto_reference_and_pair_run_in_one_invocation(self):
+        patches = self.patched_dependencies()
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            run(self.args(execute=True, auto_reference=True))
+        self.assertEqual(self.capture_durations, [30.0, 0, 0, 0, 0])
+        self.assertEqual(FakeSchedule.phases[0], ("probe", 0))
+        self.assertTrue((self.campaign / "case_0001" / "complete.json").is_file())
+
+    def test_incomplete_auto_reference_blocks_retry_before_send(self):
+        def interrupted_capture(output_dir, duration_seconds, expected_config=None):
+            output_dir.mkdir(parents=True)
+            (output_dir / "partial.blf").write_bytes(b"incomplete")
+            raise RuntimeError("baseline capture interrupted")
+
+        with patch("canoe_paired_cycle.capture_measurement", side_effect=interrupted_capture), \
+                patch("canoe_paired_cycle._disk_preflight"):
+            with self.assertRaisesRegex(RuntimeError, "baseline capture interrupted"):
+                run(self.args(execute=True, auto_reference=True))
+        self.assertFalse((self.campaign / "case_0001").exists())
+        with patch("canoe_paired_cycle.capture_measurement") as capture:
+            with self.assertRaisesRegex(ValueError, "incomplete"):
+                run(self.args(execute=True, auto_reference=True))
+        capture.assert_not_called()
+
+    def test_changed_auto_reference_log_blocks_retry_before_send(self):
+        patches = self.patched_dependencies()
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            run(self.args(auto_reference=True))
+            blf = self.campaign / "reference_baseline" / "raw" / "capture.blf"
+            with blf.open("ab") as output:
+                output.write(b"changed")
+            before = len(self.captures)
+            with self.assertRaisesRegex(ValueError, "reference baseline log changed"):
+                run(self.args(execute=True, auto_reference=True))
+            self.assertEqual(len(self.captures), before)
+
+    def test_auto_reference_requires_new_campaign_start_or_existing_reference(self):
+        with patch("canoe_paired_cycle.capture_measurement") as capture:
+            with self.assertRaisesRegex(ValueError, "must start at case 1"):
+                run(self.args(start=2, auto_reference=True))
+        capture.assert_not_called()
 
     def test_passive_probe_submits_no_can_frames(self):
         patches = self.patched_dependencies()
