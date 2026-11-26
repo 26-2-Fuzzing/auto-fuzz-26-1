@@ -22,11 +22,14 @@ campaign은 mutation 방식별 고정 폴더를 사용하므로 다음 묶음은
 
 ### 2. 레포지토리 클론
 ```bash
-git clone https://github.com/cxogus0822/auto-fuzz-26-1.git
-cd auto-fuzz
+git clone --branch CANoe2 --single-branch https://github.com/26-2-Fuzzing/auto-fuzz-26-1.git
+cd auto-fuzz-26-1
 ```
 
 ### 3. 가상환경(venv) 생성 및 활성화
+CANoe paired WSL 실행에는 위 [CANoe paired 실행 가이드](pi_can_lab/CANOE_PAIRED.md)의
+Windows `.venv-win` 환경을 사용합니다. 아래 `.venv` 절은 일반 개발 환경용입니다.
+
 > 활성화되면 프롬프트에 `(.venv)`가 표시됩니다.
 * Windows (CMD)
 ```bash
