@@ -11,10 +11,17 @@
   Windows 드라이브(`/mnt/c/...` 등)에 둔다.
 - `pi_can_lab/canoe/config/ThreeChannelCAN.cfg`를 CANoe에서 연다. 함께 제공된
   CAPL·시스템 변수·로깅 구성 요소의 참조 경로를 해당 PC에 맞게 확인하고
-  CAPL을 빌드한다. 세 CAN 채널의 하드웨어 매핑, Real Bus·Online Mode,
-  BLF·ASC 로깅과 파일명 자동 증가를 확인한다. 측정은 정지해 둔다.
+  CAPL이 동작하는지 확인한다. 저장소에는 빌드 결과물인 `FuzzHarness.cbf`가
+  포함되지 않는다. CANoe가 자동으로 준비해 `--probe-only` 검증이 통과하면
+  수동 빌드는 필요 없고, 컴파일 오류나 heartbeat 오류가 나면
+  `FuzzHarness.can`을 CANoe에서 빌드한다. 세 CAN 채널의 하드웨어 매핑,
+  Real Bus·Online Mode, BLF·ASC 로깅과 파일명 자동 증가를 확인한다.
+  측정은 정지해 둔다.
   이 설정은 CANoe 20.0.195에서 저장됐다. 다른 버전에서 열면 설정 변환이나
   오래된 Vector 공용 템플릿 경로에 대한 경고를 확인한다.
+- 제공 압축본의 동명 CFG·CAPL 소스·시스템 변수는 저장소 파일과 내용이 같다.
+  어느 복사본을 열든 `cfg` 변수와 `--canoe-config`에는 CANoe에서 **실제로
+  열어 둔 CFG 경로**를 넣는다. CFG 파일 경로가 다르면 실행기가 중단한다.
 - 아래 예시의 `channel=2`는 대상 `0x366`을 수신·송신할 CANoe 채널이다.
   실제 배선과 CANoe 채널 매핑을 **CAN2 기준으로 맞춘다**. 실행기는 현재
   `--channel 2`만 허용한다. 다른 두 채널도 수신 상태여야 한다. 실차 시험은
@@ -61,6 +68,10 @@ py.exe -3 -m venv "$(wslpath -w "$repo/.venv-win")"
 같은 송신 payload가 서로 다른 방식에도 속할 수 있으므로 방식별 case를 단순히
 합쳐 고유 변이 수로 해석하지 않는다. case 번호는 방식마다 1번부터 시작하며,
 **방식마다 별도 campaign 디렉터리**를 쓴다.
+이전 `CANoe` 직접 송신 카탈로그는 방식 간 중복도 제외했지만, `CANoe2`는
+선택한 방식 내부의 중복만 제외한다. 변이 생성 규칙과 DBC는 동일하다.
+예를 들어 이전에 `signal_single`과 겹쳐 실행 목록에서 빠졌던
+`undefined_enum` 53개가 이제 해당 방식의 case로 선택된다.
 
 ## 기준 baseline 준비
 
